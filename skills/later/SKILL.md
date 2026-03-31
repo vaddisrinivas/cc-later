@@ -130,16 +130,3 @@ If the file doesn't exist, create it with this header:
 ```
 
 Append new entries at the bottom. Never reorder, edit, or delete existing entries unless explicitly asked.
-
----
-
-## Full example
-
-```markdown
-# LATER
-
-- [!] Fix SQL injection in `ReportFilter.build_query()` (src/reports/filter.py) — user input concatenated directly into raw SQL
-- [ ] Add missing error handling in `UserService.delete()` (src/services/user.py) — DB exceptions silently swallowed
-- [ ] Update README install steps — still references `setup.py`, project uses `pyproject.toml` since v1.2
-- [x] Remove unused `legacy_auth` import in middleware/auth.py
-```

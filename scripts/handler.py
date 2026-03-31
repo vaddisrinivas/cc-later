@@ -954,6 +954,46 @@ def _read_hook_stdin() -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _apply_completed_result(
+    cfg: AppConfig, repo_key: str, repo_state: RepoState, result_path: Path
+) -> bool:
+    """Parse a completed dispatch result and mark done entries in LATER.md.
+
+    Returns True if the result was processed (caller should finalize the repo state),
+    False if the result file was unreadable (caller should leave the dispatch in-flight).
+    """
+    raw = _safe_read_text(result_path)
+    if raw is None:
+        return False
+    summary = parse_result_summary(raw)
+    done_ids = {task_id for task_id, status in summary.items() if status == "DONE"}
+    if done_ids and repo_state.entries:
+        later_path = Path(repo_key) / cfg.later_md.path
+        content = _safe_read_text(later_path)
+        if content is not None:
+            dispatched_entries = [
+                LaterEntry(
+                    id=str(entry.get("id", "")),
+                    text=str(entry.get("text", "")),
+                    is_priority=bool(entry.get("is_priority", False)),
+                    line_index=int(entry.get("line_index", 0)),
+                    raw_line=str(entry.get("raw_line", "")),
+                )
+                for entry in repo_state.entries
+                if isinstance(entry, dict)
+            ]
+            updated = apply_completion(
+                content=content,
+                done_ids=done_ids,
+                dispatched_entries=dispatched_entries,
+                mark_mode=cfg.later_md.mark_completed,
+            )
+            if updated != content:
+                later_path.parent.mkdir(parents=True, exist_ok=True)
+                later_path.write_text(updated, encoding="utf-8")
+    return True
+
+
 def _reconcile_in_flight(cfg: AppConfig, state: AppState) -> int:
     completed = 0
     for repo_key, repo_state in state.repos.items():
@@ -984,36 +1024,8 @@ def _reconcile_in_flight(cfg: AppConfig, state: AppState) -> int:
             repo_state.entries = []
             continue
 
-        raw = _safe_read_text(result_path)
-        if raw is None:
+        if not _apply_completed_result(cfg, repo_key, repo_state, result_path):
             continue
-        summary = parse_result_summary(raw)
-        done_ids = {task_id for task_id, status in summary.items() if status == "DONE"}
-
-        if done_ids and repo_state.entries:
-            later_path = Path(repo_key) / cfg.later_md.path
-            content = _safe_read_text(later_path)
-            if content is not None:
-                dispatched_entries = [
-                    LaterEntry(
-                        id=str(entry.get("id", "")),
-                        text=str(entry.get("text", "")),
-                        is_priority=bool(entry.get("is_priority", False)),
-                        line_index=int(entry.get("line_index", 0)),
-                        raw_line=str(entry.get("raw_line", "")),
-                    )
-                    for entry in repo_state.entries
-                    if isinstance(entry, dict)
-                ]
-                updated = apply_completion(
-                    content=content,
-                    done_ids=done_ids,
-                    dispatched_entries=dispatched_entries,
-                    mark_mode=cfg.later_md.mark_completed,
-                )
-                if updated != content:
-                    later_path.parent.mkdir(parents=True, exist_ok=True)
-                    later_path.write_text(updated, encoding="utf-8")
 
         repo_state.in_flight = False
         repo_state.pid = None
@@ -1181,7 +1193,10 @@ def _render_prompt(repo_path: Path, cfg: AppConfig, entries: list[LaterEntry]) -
         "When finished, output one summary line per item using this format:\n"
         "DONE <id>: <item text>\n"
         "SKIPPED (<reason>) <id>: <item text>\n"
-        "NEEDS_HUMAN (<reason>) <id>: <item text>\n"
+        "NEEDS_HUMAN (<reason>) <id>: <item text>\n\n"
+        "Every item in the list above must have a corresponding output line. "
+        "Never silently omit an item — use SKIPPED with a reason if the item "
+        "cannot be located, executed, or is out of scope.\n"
     )
 
 

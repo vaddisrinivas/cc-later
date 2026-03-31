@@ -137,6 +137,121 @@ class WindowModeTests(unittest.TestCase):
         now = datetime(2026, 3, 30, 10, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
         self.assertFalse(self.handler._is_in_peak_window(now, []))
 
+    # ── Auto-trigger threshold tests (trigger_at_minutes_remaining = 85) ────
+
+    def test_trigger_at_85_fires_when_remaining_lte_85(self):
+        now = datetime(2026, 3, 30, 1, 30, tzinfo=ZoneInfo("America/New_York"))
+        # Exactly at threshold — should fire
+        self.assertTrue(
+            self.handler.should_dispatch_by_mode(
+                dispatch_mode="window_aware",
+                now_local=now,
+                fallback_dispatch_hours=[],
+                remaining_minutes=85,
+                trigger_at_minutes_remaining=85,
+            )
+        )
+        # One minute inside threshold — should fire
+        self.assertTrue(
+            self.handler.should_dispatch_by_mode(
+                dispatch_mode="window_aware",
+                now_local=now,
+                fallback_dispatch_hours=[],
+                remaining_minutes=60,
+                trigger_at_minutes_remaining=85,
+            )
+        )
+
+    def test_trigger_at_85_does_not_fire_when_remaining_gt_85(self):
+        now = datetime(2026, 3, 30, 1, 30, tzinfo=ZoneInfo("America/New_York"))
+        # One minute outside threshold — must NOT fire
+        self.assertFalse(
+            self.handler.should_dispatch_by_mode(
+                dispatch_mode="window_aware",
+                now_local=now,
+                fallback_dispatch_hours=[],
+                remaining_minutes=86,
+                trigger_at_minutes_remaining=85,
+            )
+        )
+        # Plenty of time left — must not fire
+        self.assertFalse(
+            self.handler.should_dispatch_by_mode(
+                dispatch_mode="window_aware",
+                now_local=now,
+                fallback_dispatch_hours=[],
+                remaining_minutes=200,
+                trigger_at_minutes_remaining=85,
+            )
+        )
+
+    def test_auto_trigger_from_jsonl_fires_at_85_remaining(self):
+        """End-to-end: a session started 215 min ago gives 85 remaining → triggers."""
+        # Window is 300 min total. 215 elapsed → 85 remaining → exactly at threshold.
+        now = datetime(2026, 3, 30, 4, 0, tzinfo=timezone.utc)
+        session_start = "2026-03-30T00:25:00Z"  # 215 min before now
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "session.jsonl"
+            f.write_text(
+                json.dumps({"timestamp": session_start, "usage": {"input_tokens": 100, "output_tokens": 50}}) + "\n",
+                encoding="utf-8",
+            )
+            state = self.handler.compute_window_state([root], now_utc=now)
+        self.assertIsNotNone(state)
+        self.assertEqual(state.elapsed_minutes, 215)
+        self.assertEqual(state.remaining_minutes, 85)
+        self.assertTrue(
+            self.handler.should_dispatch_by_mode(
+                dispatch_mode="window_aware",
+                now_local=now.astimezone(),
+                fallback_dispatch_hours=[],
+                remaining_minutes=state.remaining_minutes,
+                trigger_at_minutes_remaining=85,
+            )
+        )
+
+    def test_auto_trigger_does_not_fire_early_in_session(self):
+        """A fresh session (10 min elapsed) must not trigger at threshold=85."""
+        now = datetime(2026, 3, 30, 4, 0, tzinfo=timezone.utc)
+        session_start = "2026-03-30T03:50:00Z"  # only 10 min ago
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "session.jsonl"
+            f.write_text(
+                json.dumps({"timestamp": session_start, "usage": {"input_tokens": 50, "output_tokens": 20}}) + "\n",
+                encoding="utf-8",
+            )
+            state = self.handler.compute_window_state([root], now_utc=now)
+        self.assertIsNotNone(state)
+        self.assertEqual(state.remaining_minutes, 290)
+        self.assertFalse(
+            self.handler.should_dispatch_by_mode(
+                dispatch_mode="window_aware",
+                now_local=now.astimezone(),
+                fallback_dispatch_hours=[],
+                remaining_minutes=state.remaining_minutes,
+                trigger_at_minutes_remaining=85,
+            )
+        )
+
+    def test_resolve_jsonl_roots_auto_discovers_claude_dir(self):
+        """When jsonl_paths is empty, roots should include ~/.claude/projects."""
+        cfg = self.handler.WindowConfig(jsonl_paths=[])
+        roots = self.handler._resolve_jsonl_roots(cfg)
+        root_strs = [str(r) for r in roots]
+        # At least one of the auto-discovered paths should reference a claude directory
+        self.assertTrue(
+            any("claude" in s for s in root_strs),
+            f"Expected a claude path in roots, got: {root_strs}",
+        )
+
+    def test_resolve_jsonl_roots_uses_explicit_paths_when_set(self):
+        """When jsonl_paths is set, those exact paths are used (no auto-discovery)."""
+        cfg = self.handler.WindowConfig(jsonl_paths=["/tmp/my-jsonl"])
+        roots = self.handler._resolve_jsonl_roots(cfg)
+        self.assertEqual(roots, [Path("/tmp/my-jsonl")])
+
 
 if __name__ == "__main__":
     unittest.main()
