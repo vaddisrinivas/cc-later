@@ -1,0 +1,17 @@
+{
+  "name": "cc-later",
+  "owner": {
+    "name": "vaddisrinivas"
+  },
+  "metadata": {
+    "description": "Self-hosted marketplace for the cc-later plugin",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "cc-later",
+      "source": "./",
+      "description": "LATER.md task runner for expiring Claude Code windows"
+    }
+  ]
+}

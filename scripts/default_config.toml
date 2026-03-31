@@ -1,0 +1,39 @@
+[window]
+trigger_at_minutes_remaining = 30
+idle_grace_period_minutes = 10
+respect_peak_hours = true
+peak_windows = []
+dispatch_mode = "window_aware"
+fallback_dispatch_hours = []
+jsonl_paths = []
+
+[paths]
+watch = []
+exclude_patterns = ["node_modules", ".git", "__pycache__", "dist", "build", ".venv", "vendor"]
+max_files_per_scan = 200
+
+[later_md]
+path = ".claude/LATER.md"
+auto_gitignore = true
+max_entries_per_dispatch = 3
+mark_completed = "check"
+priority_marker = "[!]"
+
+[dispatch]
+enabled = false
+model = "sonnet"
+allow_file_writes = false
+max_files_written_per_task = 5
+prompt_template = ""
+output_path = "~/.cc-later/results/{repo}-{date}.json"
+
+[skill]
+suggest_threshold = "balanced"
+auto_append = true
+end_of_session_note = false
+
+[notifications]
+desktop = false
+on_dispatch = true
+on_complete = true
+on_error = true
