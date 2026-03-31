@@ -6,6 +6,18 @@
           {
             "type": "command",
             "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/handler.py",
+            "timeout": 30000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "(?i)(later\\s*(\\[!\\])?\\s*:|add\\s+(?:this\\s+)?to\\s+later|note\\s+(?:this\\s+)?for\\s+later|queue\\s+(?:this\\s+)?for\\s+later|for\\s+later)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/capture.py",
             "timeout": 5000
           }
         ]

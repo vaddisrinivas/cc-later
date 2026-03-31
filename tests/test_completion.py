@@ -55,6 +55,54 @@ NEEDS_HUMAN (prod-only) t_ccc333: rotate key
         self.assertNotIn("- [ ] task one", updated)
         self.assertIn("- [ ] task two", updated)
 
+    def test_apply_completion_noop_when_done_ids_empty(self):
+        content = "- [ ] task one\n- [ ] task two\n"
+        entries = self.handler.parse_later_entries(content)
+        updated = self.handler.apply_completion(
+            content=content,
+            done_ids=set(),
+            dispatched_entries=entries,
+            mark_mode="check",
+        )
+        self.assertEqual(updated, content)
+
+    def test_apply_completion_only_marks_done_not_skipped(self):
+        content = "- [ ] task one\n- [ ] task two\n- [ ] task three\n"
+        entries = self.handler.parse_later_entries(content)
+        # Only task one and task three are DONE; task two is SKIPPED
+        done_ids = {entries[0].id, entries[2].id}
+        updated = self.handler.apply_completion(
+            content=content,
+            done_ids=done_ids,
+            dispatched_entries=entries,
+            mark_mode="check",
+        )
+        lines = [l for l in updated.splitlines() if l.startswith("- [")]
+        self.assertEqual(lines[0], "- [x] task one")
+        self.assertEqual(lines[1], "- [ ] task two")
+        self.assertEqual(lines[2], "- [x] task three")
+
+    def test_parse_result_summary_empty_text(self):
+        self.assertEqual(self.handler.parse_result_summary(""), {})
+
+    def test_parse_result_summary_ignores_non_status_lines(self):
+        text = "Processing...\nSome output here.\nDONE t_abc: real task\nDone but not a status line"
+        result = self.handler.parse_result_summary(text)
+        self.assertEqual(list(result.keys()), ["t_abc"])
+
+    def test_apply_completion_priority_entry_marked_done(self):
+        content = "- [!] urgent task\n- [ ] normal task\n"
+        entries = self.handler.parse_later_entries(content)
+        urgent = next(e for e in entries if e.is_priority)
+        updated = self.handler.apply_completion(
+            content=content,
+            done_ids={urgent.id},
+            dispatched_entries=entries,
+            mark_mode="check",
+        )
+        self.assertIn("- [x] urgent task", updated)
+        self.assertIn("- [ ] normal task", updated)
+
 
 if __name__ == "__main__":
     unittest.main()

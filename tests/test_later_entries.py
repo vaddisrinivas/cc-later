@@ -33,6 +33,47 @@ class LaterEntryTests(unittest.TestCase):
         self.assertEqual(ids_first, ids_second)
         self.assertEqual(len(set(ids_first)), 2)
 
+    def test_empty_content_returns_no_entries(self):
+        self.assertEqual(self.handler.parse_later_entries(""), [])
+        self.assertEqual(self.handler.parse_later_entries("\n\n"), [])
+
+    def test_all_completed_items_returns_no_pending(self):
+        content = "- [x] done one\n- [x] done two\n"
+        entries = self.handler.parse_later_entries(content)
+        self.assertEqual(entries, [])
+
+    def test_malformed_lines_are_ignored(self):
+        content = "# LATER\n\nSome prose text.\n- [ ] valid task\n- invalid\n[ ] no dash\n"
+        entries = self.handler.parse_later_entries(content)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].text, "valid task")
+
+    def test_custom_priority_marker(self):
+        content = "- [ ] normal\n- [*] starred priority\n"
+        entries = self.handler.parse_later_entries(content, priority_marker="[*]")
+        self.assertEqual(len(entries), 2)
+        priority = [e for e in entries if e.is_priority]
+        self.assertEqual(len(priority), 1)
+        self.assertEqual(priority[0].text, "starred priority")
+
+    def test_select_entries_respects_max(self):
+        content = "\n".join(f"- [ ] task {i}" for i in range(10))
+        entries = self.handler.parse_later_entries(content)
+        selected = self.handler.select_entries(entries, max_entries=3)
+        self.assertEqual(len(selected), 3)
+
+    def test_select_entries_zero_max_returns_empty(self):
+        content = "- [ ] some task\n"
+        entries = self.handler.parse_later_entries(content)
+        self.assertEqual(self.handler.select_entries(entries, max_entries=0), [])
+
+    def test_is_priority_flag_set_correctly(self):
+        content = "- [!] urgent\n- [ ] normal\n"
+        entries = self.handler.parse_later_entries(content)
+        by_text = {e.text: e for e in entries}
+        self.assertTrue(by_text["urgent"].is_priority)
+        self.assertFalse(by_text["normal"].is_priority)
+
 
 if __name__ == "__main__":
     unittest.main()

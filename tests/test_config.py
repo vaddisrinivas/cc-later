@@ -39,6 +39,45 @@ class ConfigValidationTests(unittest.TestCase):
                 }
             )
 
+    def test_rejects_invalid_dispatch_mode(self):
+        with self.assertRaises(self.handler.ConfigError):
+            self.handler.validate_config_dict(
+                {"window": {"dispatch_mode": "invalid_mode"}}
+            )
+
+    def test_rejects_invalid_model(self):
+        with self.assertRaises(self.handler.ConfigError):
+            self.handler.validate_config_dict(
+                {"dispatch": {"model": "gpt-4"}}
+            )
+
+    def test_rejects_invalid_mark_completed(self):
+        with self.assertRaises(self.handler.ConfigError):
+            self.handler.validate_config_dict(
+                {"later_md": {"mark_completed": "archive"}}
+            )
+
+    def test_empty_config_uses_all_defaults(self):
+        cfg = self.handler.validate_config_dict({})
+        self.assertFalse(cfg.dispatch.enabled)
+        self.assertEqual(cfg.window.dispatch_mode, "window_aware")
+        self.assertEqual(cfg.later_md.max_entries_per_dispatch, 3)
+        self.assertFalse(cfg.dispatch.allow_file_writes)
+
+    def test_accepts_all_valid_dispatch_modes(self):
+        for mode in ("window_aware", "time_based", "always"):
+            cfg = self.handler.validate_config_dict(
+                {"window": {"dispatch_mode": mode}}
+            )
+            self.assertEqual(cfg.window.dispatch_mode, mode)
+
+    def test_accepts_both_valid_models(self):
+        for model in ("sonnet", "opus"):
+            cfg = self.handler.validate_config_dict(
+                {"dispatch": {"model": model}}
+            )
+            self.assertEqual(cfg.dispatch.model, model)
+
 
 if __name__ == "__main__":
     unittest.main()

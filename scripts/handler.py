@@ -23,7 +23,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 
-APP_DIR = Path("~/.cc-later").expanduser()
+APP_DIR = Path(os.environ.get("CC_LATER_APP_DIR", "~/.cc-later")).expanduser()
 CONFIG_PATH = APP_DIR / "config.toml"
 RUN_LOG_PATH = APP_DIR / "run_log.jsonl"
 STATE_PATH = APP_DIR / "state.json"
@@ -513,7 +513,96 @@ def log_event(event: str, **fields: Any) -> None:
         fh.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
+def _gate(label: str, ok: bool) -> None:
+    symbol = "\u2713" if ok else "\u2717"
+    print(f"  Gate: {label} {symbol}")
+
+
+def _dry_run_report(cfg: AppConfig) -> int:
+    """Print gate evaluation and queue preview. Read-only: no state mutations."""
+    state = load_state()
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone()
+
+    print("[cc-later --dry-run]")
+    _gate("dispatch.enabled", cfg.dispatch.enabled)
+    _gate(f"paths.watch non-empty ({len(cfg.paths.watch)} paths)", bool(cfg.paths.watch))
+
+    if cfg.window.respect_peak_hours:
+        in_peak = _is_in_peak_window(now_local, cfg.window.peak_windows)
+        _gate("not in peak window", not in_peak)
+
+    previous_hook_ts = _parse_iso8601(state.last_hook_ts) if state.last_hook_ts else None
+    if previous_hook_ts is not None:
+        idle_since = (now_utc - previous_hook_ts).total_seconds() / 60
+        idle_ok = idle_since >= cfg.window.idle_grace_period_minutes
+        _gate(
+            f"idle grace ({idle_since:.1f} min since last hook,"
+            f" need {cfg.window.idle_grace_period_minutes} min)",
+            idle_ok,
+        )
+    else:
+        _gate(
+            f"idle grace (no previous hook recorded, need {cfg.window.idle_grace_period_minutes} min)",
+            True,
+        )
+
+    mode = cfg.window.dispatch_mode
+    if mode == "window_aware":
+        roots = _resolve_jsonl_roots(cfg.window)
+        ws = compute_window_state(roots, now_utc=now_utc)
+        if ws is None:
+            _gate("mode window_aware: JSONL readable", False)
+        else:
+            mode_ok = ws.remaining_minutes <= cfg.window.trigger_at_minutes_remaining
+            _gate(
+                f"mode window_aware ({ws.remaining_minutes} min remaining,"
+                f" trigger \u2264 {cfg.window.trigger_at_minutes_remaining})",
+                mode_ok,
+            )
+    elif mode == "time_based":
+        time_ok = is_within_time_ranges(now_local, cfg.window.fallback_dispatch_hours)
+        _gate(
+            f"mode time_based (now {'in' if time_ok else 'outside'} dispatch hours)",
+            time_ok,
+        )
+    else:  # always
+        _gate("mode always (no time restriction)", True)
+
+    print()
+    for repo_path in _expand_watch_paths(cfg.paths.watch):
+        repo_key = str(repo_path)
+        repo_state = state.repos.get(repo_key, RepoState())
+        later_path = repo_path / cfg.later_md.path
+
+        print(f"Repo {repo_path}:")
+        if repo_state.in_flight:
+            print("  [in-flight \u2014 skipping]")
+            continue
+        if not later_path.exists():
+            print(f"  No LATER.md at {cfg.later_md.path}")
+            continue
+        content = _safe_read_text(later_path)
+        if content is None:
+            print(f"  Could not read {cfg.later_md.path}")
+            continue
+
+        entries = parse_later_entries(content, priority_marker=cfg.later_md.priority_marker)
+        selected = select_entries(entries, cfg.later_md.max_entries_per_dispatch)
+        if not selected:
+            print("  No pending entries")
+        else:
+            plural = "entry" if len(selected) == 1 else "entries"
+            print(f"  Would dispatch {len(selected)} {plural}:")
+            for entry in selected:
+                marker = "[!]" if entry.is_priority else "[ ]"
+                print(f"    {marker} {entry.id}: {entry.text}")
+
+    return 0
+
+
 def main() -> int:
+    dry_run = "--dry-run" in sys.argv
     lock = NonBlockingFileLock(LOCK_PATH)
     if not lock.acquire():
         print("[cc-later] Handler busy; skipping this Stop event.")
@@ -530,6 +619,9 @@ def main() -> int:
             return 0
         if cfg is None:
             return 0
+
+        if dry_run:
+            return _dry_run_report(cfg)
 
         state = load_state()
         now_utc = datetime.now(timezone.utc)
@@ -850,6 +942,8 @@ def _read_toml(path: Path) -> dict[str, Any]:
 
 
 def _read_hook_stdin() -> dict[str, Any]:
+    if sys.stdin.isatty():
+        return {}
     data = sys.stdin.read().strip()
     if not data:
         return {}
@@ -869,6 +963,21 @@ def _reconcile_in_flight(cfg: AppConfig, state: AppState) -> int:
             continue
         result_path = Path(repo_state.result_path).expanduser() if repo_state.result_path else None
         if result_path is None or not result_path.exists():
+            if repo_state.pid is not None:
+                repo_name = Path(repo_key).name
+                log_event(
+                    "dispatch_failed",
+                    repo=repo_key,
+                    pid=repo_state.pid,
+                    result_path=str(result_path) if result_path else None,
+                )
+                print(f"[cc-later] WARN: Dispatch failed for {repo_name} (no result file)")
+                _maybe_notify(
+                    cfg.notifications,
+                    "cc-later",
+                    f"Dispatch failed for {repo_name}",
+                    "on_error",
+                )
             repo_state.in_flight = False
             repo_state.pid = None
             repo_state.result_path = None
