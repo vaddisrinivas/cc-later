@@ -1,0 +1,103 @@
+import tempfile
+import unittest
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from tests._loader import load_handler_module
+
+
+class RotationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.handler = load_handler_module()
+
+    def _make_later(self, tmpdir: str, content: str, days_old: int = 1) -> Path:
+        later = Path(tmpdir) / ".claude" / "LATER.md"
+        later.parent.mkdir(parents=True, exist_ok=True)
+        later.write_text(content, encoding="utf-8")
+        if days_old > 0:
+            import os
+            old_ts = (datetime.now() - timedelta(days=days_old)).timestamp()
+            os.utime(later, (old_ts, old_ts))
+        return later
+
+    def test_rotates_when_mtime_is_yesterday(self):
+        now = datetime.now(ZoneInfo("America/New_York"))
+        with tempfile.TemporaryDirectory() as td:
+            content = "# LATER\n\n- [ ] pending task\n- [x] done task\n"
+            later = self._make_later(td, content, days_old=1)
+            rotated = self.handler.rotate_later_if_needed(later, now)
+        self.assertTrue(rotated)
+
+    def test_no_rotation_when_mtime_is_today(self):
+        now = datetime.now(ZoneInfo("America/New_York"))
+        with tempfile.TemporaryDirectory() as td:
+            content = "# LATER\n\n- [ ] pending task\n"
+            later = self._make_later(td, content, days_old=0)
+            rotated = self.handler.rotate_later_if_needed(later, now)
+        self.assertFalse(rotated)
+
+    def test_archive_file_created_with_full_content(self):
+        now = datetime.now(ZoneInfo("America/New_York"))
+        with tempfile.TemporaryDirectory() as td:
+            content = "# LATER\n\n- [ ] pending\n- [x] done\n"
+            later = self._make_later(td, content, days_old=1)
+            yesterday = (datetime.now() - timedelta(days=1)).date()
+            archive_path = later.parent / f"LATER-{yesterday.isoformat()}.md"
+            self.handler.rotate_later_if_needed(later, now)
+            self.assertTrue(archive_path.exists())
+            archived = archive_path.read_text(encoding="utf-8")
+            self.assertIn("pending", archived)
+            self.assertIn("done", archived)
+
+    def test_new_later_md_has_only_pending_entries(self):
+        now = datetime.now(ZoneInfo("America/New_York"))
+        with tempfile.TemporaryDirectory() as td:
+            content = "# LATER\n\n- [ ] keep this\n- [x] discard done\n- [!] keep urgent\n"
+            later = self._make_later(td, content, days_old=1)
+            self.handler.rotate_later_if_needed(later, now)
+            fresh = later.read_text(encoding="utf-8")
+            self.assertIn("keep this", fresh)
+            self.assertIn("keep urgent", fresh)
+            self.assertNotIn("discard done", fresh)
+
+    def test_sections_preserved_in_fresh_file(self):
+        now = datetime.now(ZoneInfo("America/New_York"))
+        with tempfile.TemporaryDirectory() as td:
+            content = (
+                "# LATER\n\n"
+                "## Tests\n- [ ] add tests\n- [x] done test\n\n"
+                "## Reports\n- [ ] generate report\n"
+            )
+            later = self._make_later(td, content, days_old=1)
+            self.handler.rotate_later_if_needed(later, now)
+            fresh = later.read_text(encoding="utf-8")
+            self.assertIn("## Tests", fresh)
+            self.assertIn("add tests", fresh)
+            self.assertNotIn("done test", fresh)
+            self.assertIn("## Reports", fresh)
+            self.assertIn("generate report", fresh)
+
+    def test_all_done_file_produces_empty_fresh_file(self):
+        now = datetime.now(ZoneInfo("America/New_York"))
+        with tempfile.TemporaryDirectory() as td:
+            content = "# LATER\n\n- [x] all done\n- [x] also done\n"
+            later = self._make_later(td, content, days_old=1)
+            self.handler.rotate_later_if_needed(later, now)
+            fresh = later.read_text(encoding="utf-8")
+            self.assertNotIn("all done", fresh)
+            self.assertNotIn("also done", fresh)
+            # Should still be a valid file with just the header
+            self.assertIn("# LATER", fresh)
+
+    def test_no_rotation_when_file_missing(self):
+        now = datetime.now(ZoneInfo("America/New_York"))
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / ".claude" / "LATER.md"
+            rotated = self.handler.rotate_later_if_needed(missing, now)
+        self.assertFalse(rotated)
+
+
+if __name__ == "__main__":
+    unittest.main()

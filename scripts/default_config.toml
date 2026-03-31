@@ -37,3 +37,13 @@ desktop = false
 on_dispatch = true
 on_complete = true
 on_error = true
+
+[budget]
+# Informational plan label (pro, max, custom)
+plan = "pro"
+# Total token budget per rolling 7-day window
+weekly_token_budget = 10_000_000
+# Stop dispatching background tasks when this % of budget is used
+backoff_at_pct = 80
+# Model used for window-initiation probe pings (should be fast and cheap)
+probe_model = "claude-haiku-4-5-20251001"

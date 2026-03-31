@@ -74,6 +74,47 @@ class LaterEntryTests(unittest.TestCase):
         self.assertTrue(by_text["urgent"].is_priority)
         self.assertFalse(by_text["normal"].is_priority)
 
+    def test_section_assigned_to_entries_under_header(self):
+        content = """# LATER
+
+## Tests
+- [ ] Add integration tests
+
+## Reports
+- [ ] Generate perf report
+"""
+        entries = self.handler.parse_later_entries(content)
+        self.assertEqual(len(entries), 2)
+        by_text = {e.text: e for e in entries}
+        self.assertEqual(by_text["Add integration tests"].section, "Tests")
+        self.assertEqual(by_text["Generate perf report"].section, "Reports")
+
+    def test_entries_before_any_section_have_none_section(self):
+        content = "# LATER\n\n- [ ] no section task\n\n## Tests\n- [ ] sectioned task\n"
+        entries = self.handler.parse_later_entries(content)
+        by_text = {e.text: e for e in entries}
+        self.assertIsNone(by_text["no section task"].section)
+        self.assertEqual(by_text["sectioned task"].section, "Tests")
+
+    def test_section_not_confused_with_task_lines(self):
+        content = "## Security\n- [!] Fix injection\n- [ ] normal\n"
+        entries = self.handler.parse_later_entries(content)
+        self.assertEqual(len(entries), 2)
+        for entry in entries:
+            self.assertEqual(entry.section, "Security")
+
+    def test_priority_ordering_preserved_across_sections(self):
+        content = """## Reports
+- [ ] report task
+
+## Security
+- [!] urgent fix
+"""
+        entries = self.handler.parse_later_entries(content)
+        selected = self.handler.select_entries(entries, max_entries=2)
+        self.assertEqual(selected[0].text, "urgent fix")
+        self.assertEqual(selected[1].text, "report task")
+
 
 if __name__ == "__main__":
     unittest.main()

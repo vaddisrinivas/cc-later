@@ -129,4 +129,35 @@ If the file doesn't exist, create it with this header:
 # LATER
 ```
 
-Append new entries at the bottom. Never reorder, edit, or delete existing entries unless explicitly asked.
+### Sections
+
+Organise entries under `##` section headers. Use these standard sections:
+
+| Section | When to use |
+|---------|-------------|
+| `## Security` | Injection risks, hardcoded secrets, auth bypasses — always `[!]` |
+| `## Bugs` | Silent failures, wrong behaviour, data loss risks |
+| `## Tests` | Missing coverage, always-passing tests, test gap evidence |
+| `## Docs` | README drift, missing docstrings, stale CHANGELOG |
+| `## Refactor` | Bounded cleanup: dead code, oversized functions, type hints |
+| `## Reports` | Audit or analysis tasks that produce a markdown output |
+
+Example well-formed LATER.md:
+
+```markdown
+# LATER
+
+## Security
+- [!] Fix SQL injection in ReportFilter.build_query() (src/reports/filter.py) — user input concatenated directly
+
+## Tests
+- [ ] Add integration tests for MCP runner tool call round-trips (tests/test_mcp_integration.py) — no coverage for timeout case
+- [ ] Add edge case tests for auth flow on Safari — confirmed missing in test/auth.test.ts
+
+## Reports
+- [ ] Generate perf audit from logs/ — output to .claude/reports/perf-{date}.md
+```
+
+If no section fits, append to the closest match or use `## Misc`.
+
+Append new entries under the appropriate section. Never reorder, edit, or delete existing entries unless explicitly asked.

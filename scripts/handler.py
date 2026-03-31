@@ -40,12 +40,17 @@ class ConfigError(Exception):
     """Raised when config is invalid."""
 
 
+CONTEXT_WINDOW_TOKENS = 200_000
+
+
 @dataclass
 class WindowState:
     elapsed_minutes: int
     remaining_minutes: int
     total_input_tokens: int
     total_output_tokens: int
+    context_pct_used: float = 0.0
+    session_id: str | None = None
     source_path: str | None = None
 
 
@@ -112,6 +117,22 @@ class NotificationConfig:
 
 
 @dataclass
+class BudgetConfig:
+    plan: str = "pro"
+    weekly_token_budget: int = 10_000_000
+    backoff_at_pct: int = 80
+    probe_model: str = "claude-haiku-4-5-20251001"
+
+
+@dataclass
+class BudgetState:
+    tokens_used_this_week: int
+    weekly_budget: int
+    pct_used: float
+    tokens_remaining: int
+
+
+@dataclass
 class AppConfig:
     window: WindowConfig = field(default_factory=WindowConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
@@ -119,6 +140,7 @@ class AppConfig:
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
     skill: SkillConfig = field(default_factory=SkillConfig)
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
+    budget: BudgetConfig = field(default_factory=BudgetConfig)
 
 
 @dataclass
@@ -128,6 +150,7 @@ class LaterEntry:
     is_priority: bool
     line_index: int
     raw_line: str
+    section: str | None = None
 
 
 @dataclass
@@ -216,6 +239,7 @@ def validate_config_dict(raw: dict[str, Any]) -> AppConfig:
         },
         "skill": {"suggest_threshold", "auto_append", "end_of_session_note"},
         "notifications": {"desktop", "on_dispatch", "on_complete", "on_error"},
+        "budget": {"plan", "weekly_token_budget", "backoff_at_pct", "probe_model"},
     }
 
     unknown_sections = set(raw) - set(schema)
@@ -241,6 +265,7 @@ def validate_config_dict(raw: dict[str, Any]) -> AppConfig:
     _merge_dataclass_from_dict(cfg.dispatch, raw.get("dispatch", {}))
     _merge_dataclass_from_dict(cfg.skill, raw.get("skill", {}))
     _merge_dataclass_from_dict(cfg.notifications, raw.get("notifications", {}))
+    _merge_dataclass_from_dict(cfg.budget, raw.get("budget", {}))
 
     if cfg.window.dispatch_mode not in {"window_aware", "time_based", "always"}:
         raise ConfigError(
@@ -262,11 +287,19 @@ def validate_config_dict(raw: dict[str, Any]) -> AppConfig:
     return cfg
 
 
+SECTION_PATTERN = re.compile(r"^##\s+(.+)$")
+
+
 def parse_later_entries(content: str, priority_marker: str = "[!]") -> list[LaterEntry]:
-    """Parse pending entries from LATER.md."""
+    """Parse pending entries from LATER.md, tracking ## section headers."""
     entries: list[LaterEntry] = []
     priority_char = _extract_marker_char(priority_marker)
+    current_section: str | None = None
     for idx, line in enumerate(content.splitlines()):
+        section_match = SECTION_PATTERN.match(line)
+        if section_match:
+            current_section = section_match.group(1).strip()
+            continue
         match = TASK_LINE_PATTERN.match(line)
         if not match:
             continue
@@ -290,6 +323,7 @@ def parse_later_entries(content: str, priority_marker: str = "[!]") -> list[Late
                 is_priority=is_priority,
                 line_index=idx,
                 raw_line=line,
+                section=current_section,
             )
         )
     return entries
@@ -345,12 +379,20 @@ def is_within_time_ranges(now_local: datetime, ranges: list[str]) -> bool:
 
 
 def compute_window_state(
-    jsonl_roots: list[Path], now_utc: datetime
+    jsonl_roots: list[Path],
+    now_utc: datetime,
+    session_id: str | None = None,
 ) -> WindowState | None:
+    """Compute window state from JSONL files.
+
+    If session_id is provided, scopes to that session's file only (per-session tracking).
+    Otherwise aggregates across all JSONL files modified within the last 5 hours.
+    """
     earliest: datetime | None = None
     input_tokens = 0
     output_tokens = 0
     selected_source: str | None = None
+    matched_session_id: str | None = None
 
     for root in jsonl_roots:
         if not root.exists():
@@ -364,6 +406,10 @@ def compute_window_state(
 
         root_had_recent = False
         for file_path in files:
+            # If session_id provided, only read the matching file
+            if session_id is not None:
+                if session_id not in file_path.stem and session_id not in str(file_path):
+                    continue
             try:
                 mtime = datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc)
             except OSError:
@@ -377,10 +423,17 @@ def compute_window_state(
                     continue
                 if earliest is None or ts < earliest:
                     earliest = ts
-                usage = row.get("usage", {})
+                # Support both "message_usage" (Claude Code JSONL) and "usage" (legacy)
+                usage = row.get("message_usage") or row.get("usage") or {}
                 if isinstance(usage, dict):
                     input_tokens += _coerce_int(usage.get("input_tokens"))
+                    input_tokens += _coerce_int(usage.get("cache_creation_input_tokens"))
                     output_tokens += _coerce_int(usage.get("output_tokens"))
+                # Capture session ID from the file if not provided
+                if matched_session_id is None:
+                    sid = row.get("sessionId") or row.get("session_id")
+                    if sid:
+                        matched_session_id = str(sid)
         if root_had_recent and selected_source is None:
             selected_source = str(root)
 
@@ -389,12 +442,53 @@ def compute_window_state(
 
     elapsed = int(max(0, (now_utc - earliest).total_seconds() // 60))
     remaining = max(0, DEFAULT_WINDOW_MINUTES - elapsed)
+    total_tokens = input_tokens + output_tokens
+    context_pct = min(1.0, total_tokens / CONTEXT_WINDOW_TOKENS)
     return WindowState(
         elapsed_minutes=elapsed,
         remaining_minutes=remaining,
         total_input_tokens=input_tokens,
         total_output_tokens=output_tokens,
+        context_pct_used=context_pct,
+        session_id=matched_session_id or session_id,
         source_path=selected_source,
+    )
+
+
+def compute_budget_state(
+    jsonl_roots: list[Path],
+    now_utc: datetime,
+    weekly_budget: int,
+) -> BudgetState:
+    """Sum tokens across all JSONL files from the last 7 days."""
+    cutoff = now_utc - timedelta(days=7)
+    total_tokens = 0
+
+    for root in jsonl_roots:
+        if not root.exists():
+            continue
+        files = [root] if root.is_file() else list(root.rglob("*.jsonl"))
+        for file_path in files:
+            try:
+                mtime = datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc)
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            for row in _iter_jsonl(file_path):
+                usage = row.get("message_usage") or row.get("usage") or {}
+                if isinstance(usage, dict):
+                    total_tokens += _coerce_int(usage.get("input_tokens"))
+                    total_tokens += _coerce_int(usage.get("cache_creation_input_tokens"))
+                    total_tokens += _coerce_int(usage.get("output_tokens"))
+
+    budget = max(1, weekly_budget)
+    pct = min(1.0, total_tokens / budget)
+    return BudgetState(
+        tokens_used_this_week=total_tokens,
+        weekly_budget=weekly_budget,
+        pct_used=pct,
+        tokens_remaining=max(0, weekly_budget - total_tokens),
     )
 
 
@@ -451,6 +545,71 @@ def apply_completion(
     if content.endswith("\n"):
         rewritten += "\n"
     return rewritten
+
+
+def rotate_later_if_needed(later_path: Path, now_local: datetime) -> bool:
+    """Archive LATER.md if it's from a previous day. Returns True if rotated."""
+    if not later_path.exists():
+        return False
+    try:
+        mtime_date = datetime.fromtimestamp(later_path.stat().st_mtime).date()
+    except OSError:
+        return False
+    today = now_local.date()
+    if mtime_date >= today:
+        return False
+    archive_name = f"LATER-{mtime_date.isoformat()}.md"
+    archive_path = later_path.parent / archive_name
+    content = _safe_read_text(later_path)
+    if content is None:
+        return False
+    try:
+        archive_path.write_text(content, encoding="utf-8")
+        fresh = _extract_pending_for_rotation(content)
+        later_path.write_text(fresh, encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _extract_pending_for_rotation(content: str) -> str:
+    """Rebuild LATER.md keeping only pending entries ([ ] and [!]), preserving ## sections."""
+    lines = content.splitlines()
+    out: list[str] = []
+    pending_in_current_section: list[str] = []
+    current_section_header: str | None = None
+
+    def flush_section() -> None:
+        if pending_in_current_section:
+            if current_section_header is not None:
+                out.append(current_section_header)
+                out.append("")
+            out.extend(pending_in_current_section)
+            out.append("")
+
+    for line in lines:
+        if line.startswith("# ") and not line.startswith("## "):
+            # Top-level heading: flush and emit
+            flush_section()
+            pending_in_current_section = []
+            current_section_header = None
+            out.append(line)
+            continue
+        if SECTION_PATTERN.match(line):
+            flush_section()
+            pending_in_current_section = []
+            current_section_header = line
+            continue
+        task_match = TASK_LINE_PATTERN.match(line)
+        if task_match:
+            marker = task_match.group(2)
+            if marker not in {"x", "X"}:
+                pending_in_current_section.append(line)
+        # Non-task, non-section lines (blank lines between tasks etc.) are dropped
+
+    flush_section()
+    result = "\n".join(out).strip()
+    return result + "\n" if result else "# LATER\n"
 
 
 def load_or_create_config() -> tuple[AppConfig | None, str | None]:
@@ -547,9 +706,17 @@ def _dry_run_report(cfg: AppConfig) -> int:
             True,
         )
 
+    roots = _resolve_jsonl_roots(cfg.window)
+    budget_state = compute_budget_state(roots, now_utc, cfg.budget.weekly_token_budget)
+    budget_ok = budget_state.pct_used < cfg.budget.backoff_at_pct / 100
+    _gate(
+        f"budget ({budget_state.pct_used * 100:.1f}% of {cfg.budget.weekly_token_budget:,} weekly tokens used,"
+        f" backoff at {cfg.budget.backoff_at_pct}%)",
+        budget_ok,
+    )
+
     mode = cfg.window.dispatch_mode
     if mode == "window_aware":
-        roots = _resolve_jsonl_roots(cfg.window)
         ws = compute_window_state(roots, now_utc=now_utc)
         if ws is None:
             _gate("mode window_aware: JSONL readable", False)
@@ -611,7 +778,11 @@ def main() -> int:
 
     try:
         hook_payload = _read_hook_stdin()
-        _ = hook_payload  # currently reserved for future use
+        session_id = (
+            hook_payload.get("session_id")
+            or hook_payload.get("sessionId")
+            or None
+        )
         cfg, first_run_message = load_or_create_config()
         if first_run_message:
             print(first_run_message)
@@ -660,10 +831,26 @@ def main() -> int:
             print("[cc-later] Peak window active; skipping.")
             return 0
 
+        roots = _resolve_jsonl_roots(cfg.window)
+        budget_state = compute_budget_state(roots, now_utc, cfg.budget.weekly_token_budget)
+        if budget_state.pct_used >= cfg.budget.backoff_at_pct / 100:
+            save_state(state)
+            log_event(
+                "skip",
+                reason="budget_limit",
+                pct_used=round(budget_state.pct_used * 100, 1),
+                tokens_used=budget_state.tokens_used_this_week,
+                weekly_budget=budget_state.weekly_budget,
+            )
+            print(
+                f"[cc-later] Budget limit reached: "
+                f"{budget_state.pct_used * 100:.1f}% of weekly budget used. Skipping."
+            )
+            return 0
+
         window_state: WindowState | None = None
         if cfg.window.dispatch_mode == "window_aware":
-            roots = _resolve_jsonl_roots(cfg.window)
-            window_state = compute_window_state(roots, now_utc=now_utc)
+            window_state = compute_window_state(roots, now_utc=now_utc, session_id=session_id)
             if window_state is None:
                 save_state(state)
                 log_event("skip", reason="window_unknown", mode="window_aware")
@@ -702,6 +889,10 @@ def main() -> int:
 
             if cfg.later_md.auto_gitignore:
                 _ensure_gitignore_entry(repo_path, cfg.later_md.path)
+
+            rotated = rotate_later_if_needed(later_path, now_local)
+            if rotated:
+                log_event("rotated", repo=repo_key)
 
             content = _safe_read_text(later_path)
             if content is None:
@@ -978,6 +1169,7 @@ def _apply_completed_result(
                     is_priority=bool(entry.get("is_priority", False)),
                     line_index=int(entry.get("line_index", 0)),
                     raw_line=str(entry.get("raw_line", "")),
+                    section=entry.get("section") or None,
                 )
                 for entry in repo_state.entries
                 if isinstance(entry, dict)
@@ -1153,7 +1345,18 @@ def _expand_watch_paths(paths: list[str]) -> list[Path]:
 
 
 def _render_prompt(repo_path: Path, cfg: AppConfig, entries: list[LaterEntry]) -> str:
-    entry_block = "\n".join(f"- {entry.id}: {entry.text}" for entry in entries)
+    # Group by section, preserving selection order within each section
+    sections: dict[str, list[LaterEntry]] = {}
+    for entry in entries:
+        key = entry.section or ""
+        sections.setdefault(key, []).append(entry)
+    blocks: list[str] = []
+    for section_name, section_entries in sections.items():
+        if section_name:
+            blocks.append(f"## {section_name}")
+        for entry in section_entries:
+            blocks.append(f"- {entry.id}: {entry.text}")
+    entry_block = "\n".join(blocks)
     if cfg.dispatch.allow_file_writes:
         write_instruction = (
             "You may edit files in this repository. "

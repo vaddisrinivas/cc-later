@@ -1,5 +1,5 @@
 {
   "name": "cc-later",
-  "version": "0.1.0",
-  "description": "Runs your LATER.md tasks when your Claude Code window is about to expire."
+  "version": "0.2.0",
+  "description": "Spot-instance scheduler: runs LATER.md tasks in idle window capacity, with budget awareness and per-session tracking."
 }

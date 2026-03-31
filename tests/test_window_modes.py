@@ -82,6 +82,70 @@ class WindowModeTests(unittest.TestCase):
             self.assertEqual(state.total_input_tokens, 30)
             self.assertEqual(state.total_output_tokens, 15)
 
+    def test_compute_window_state_reads_message_usage_field(self):
+        """JSONL rows using 'message_usage' (Claude Code format) are parsed correctly."""
+        now = datetime(2026, 3, 30, 2, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "session.jsonl"
+            rows = [
+                {
+                    "timestamp": "2026-03-30T00:00:00Z",
+                    "sessionId": "abc-123",
+                    "message_usage": {
+                        "input_tokens": 100,
+                        "cache_creation_input_tokens": 50,
+                        "output_tokens": 20,
+                    },
+                },
+            ]
+            f.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            state = self.handler.compute_window_state([root], now_utc=now)
+        self.assertIsNotNone(state)
+        # input_tokens + cache_creation counted; output_tokens counted
+        self.assertEqual(state.total_input_tokens, 150)  # 100 + 50
+        self.assertEqual(state.total_output_tokens, 20)
+        self.assertEqual(state.session_id, "abc-123")
+
+    def test_compute_window_state_context_pct_used(self):
+        """context_pct_used = (input + output) / 200_000."""
+        now = datetime(2026, 3, 30, 2, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "session.jsonl"
+            row = {
+                "timestamp": "2026-03-30T01:00:00Z",
+                "usage": {"input_tokens": 20_000, "output_tokens": 2_000},
+            }
+            f.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            state = self.handler.compute_window_state([root], now_utc=now)
+        self.assertIsNotNone(state)
+        self.assertAlmostEqual(state.context_pct_used, 22_000 / 200_000, places=5)
+
+    def test_compute_window_state_per_session_scoping(self):
+        """When session_id is provided, only that session's file is read."""
+        now = datetime(2026, 3, 30, 2, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # File matching the session
+            f_match = root / "abc-123.jsonl"
+            row_match = {
+                "timestamp": "2026-03-30T01:00:00Z",
+                "usage": {"input_tokens": 500, "output_tokens": 100},
+            }
+            f_match.write_text(json.dumps(row_match) + "\n", encoding="utf-8")
+            # Unrelated file — should be ignored
+            f_other = root / "xyz-999.jsonl"
+            row_other = {
+                "timestamp": "2026-03-30T00:00:00Z",
+                "usage": {"input_tokens": 99999, "output_tokens": 99999},
+            }
+            f_other.write_text(json.dumps(row_other) + "\n", encoding="utf-8")
+            state = self.handler.compute_window_state([root], now_utc=now, session_id="abc-123")
+        self.assertIsNotNone(state)
+        self.assertEqual(state.total_input_tokens, 500)
+        self.assertEqual(state.total_output_tokens, 100)
+
     def test_window_state_returns_none_for_empty_directory(self):
         with tempfile.TemporaryDirectory() as td:
             state = self.handler.compute_window_state([Path(td)], now_utc=datetime.now(timezone.utc))
