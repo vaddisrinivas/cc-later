@@ -22,6 +22,8 @@ priority_marker = "[!]"
 [dispatch]
 enabled = false
 model = "sonnet"
+# "fixed" = always use dispatch.model; "auto" = route by task complexity
+model_routing = "fixed"
 allow_file_writes = false
 max_files_written_per_task = 5
 prompt_template = ""
@@ -37,13 +39,29 @@ desktop = false
 on_dispatch = true
 on_complete = true
 on_error = true
+# POST JSON payloads to this URL on events (Slack/Discord incoming webhook, etc.)
+webhook_url = ""
+webhook_events = ["dispatch", "complete", "error"]
 
 [budget]
-# Informational plan label (pro, max, custom)
 plan = "pro"
-# Total token budget per rolling 7-day window
 weekly_token_budget = 10_000_000
-# Stop dispatching background tasks when this % of budget is used
 backoff_at_pct = 80
-# Model used for window-initiation probe pings (should be fast and cheap)
 probe_model = "claude-haiku-4-5-20251001"
+
+[retry]
+# Automatically retry failed tasks with exponential backoff
+enabled = true
+max_attempts = 3
+# Minutes to wait before retry: 1st retry after 30m, 2nd after 2h, 3rd after 8h
+backoff_minutes = [30, 120, 480]
+# After max_attempts, mark as [?] (needs human) instead of retrying forever
+escalate_to_priority = true
+
+[verify]
+# Verify dispatch results before marking as DONE
+enabled = true
+# Require actual git diff when allow_file_writes is on
+require_diff = false
+# Minimum confidence to accept: "low", "medium", "high"
+min_confidence = "low"

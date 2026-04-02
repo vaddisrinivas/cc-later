@@ -1,116 +1,151 @@
-# cc-later v0.1.0 Specification and Implementation Plan
+# cc-later v0.3.0 Architecture
 
-## 1. Purpose
-`cc-later` is a Claude Code plugin that drains `.claude/LATER.md` when a session window is near expiry (or in configured fallback modes), launching background `claude -p` runs using local auth already managed by Claude Code.
+## Purpose
 
-## 2. Architecture Principles
-1. Thin plugin surface, deterministic core logic.
-2. Test-first core: parsing, gating, idempotency, and completion marking are pure functions.
-3. Safe-by-default: dispatch disabled until explicit opt-in.
-4. Idempotent dispatch: never duplicate background runs for the same repo while one is in flight.
-5. Deterministic completion matching: each dispatched task has a stable ID, not raw text matching only.
-6. Strict scope boundaries: only configured watched paths and `~/.cc-later` are writable.
-7. Graceful degradation: window detection failures never crash hooks.
+cc-later is a Claude Code plugin that drains `.claude/LATER.md` when a session window is near expiry, launching background `claude -p` runs using local auth. v0.3.0 adds retry intelligence, analytics, verification, adaptive model routing, and a proper package architecture.
 
-## 3. Key Invariants (Gap Tightening)
-### 3.1 Idempotency and race control
-- Hook invocations acquire a non-blocking global lock file (`~/.cc-later/handler.lock`).
-- If lock is held, current invocation exits cleanly with a `skip` run-log entry.
-- Per-repo state tracks `in_flight` dispatch metadata; repo dispatch is skipped when already in flight.
+## Architecture Principles
 
-### 3.2 Stable task identity
-- When selecting LATER entries, handler assigns deterministic short IDs (`t_<hash>`).
-- Prompt includes task IDs and requires summary output keyed by ID.
-- Completion marking maps `DONE <id>:` back to dispatched metadata, then updates LATER deterministically.
+1. **Modular package**: Core logic in `cc_later/`, hook shims in `scripts/`.
+2. **Test-first core**: All parsing, gating, routing, retry, and verification are pure functions.
+3. **Safe-by-default**: Dispatch disabled until explicit opt-in. Read-only by default.
+4. **Idempotent dispatch**: Non-blocking lock + in-flight state prevent duplicates.
+5. **Deterministic matching**: Stable task IDs based on line index + text hash.
+6. **Smart retry**: Failed tasks get exponential backoff, then escalate to needs-human.
+7. **Verification gate**: Result quality scored before marking DONE.
+8. **Adaptive routing**: Task complexity drives model selection.
+9. **Observable**: SQLite analytics, rich reports, webhook notifications.
 
-### 3.3 Write safety
-- Background subprocess runs with `cwd=<repo>`.
-- If writes enabled, prompt enforces max file count and repo-local scope.
-- Handler records changed-mode intent but does not grant broader filesystem scope itself.
+## Module Map
 
-### 3.4 Failure/backoff behavior
-- Config/JSONL/parse errors produce `error` or `skip` log events and exit `0`.
-- Optional notification on error is controlled by config.
-- Repeated noisy dispatch is prevented by `idle_grace_period_minutes` and in-flight state checks.
+### `cc_later/models.py`
+All dataclasses: `AppConfig`, `WindowState`, `BudgetState`, `LaterEntry`, `RepoState`, `AppState`, plus config sub-models (`WindowConfig`, `RetryConfig`, `VerifyConfig`, etc.).
 
-## 4. File-by-File Plan
+### `cc_later/config.py`
+Strict schema validation with unknown-key rejection. Loads from `~/.cc-later/config.toml` with TOML parsing via compat shim (supports Python 3.9+).
 
-### Root
-- `README.md`: user install/setup docs (concise, <=100 lines target).
-- `SPEC.md`: this architecture and implementation plan.
-- `.claude-plugin/marketplace.json`: self-hosted marketplace catalog.
+### `cc_later/parser.py`
+Pure functions for LATER.md:
+- `parse_later_entries()` — section tracking, retry metadata, dependency parsing
+- `select_entries()` — priority ordering + dependency filtering
+- `apply_completion()` — mark DONE entries as [x] or delete
+- `apply_retry_metadata()` — update attempt counts, escalate at max retries
+- `rotate_later_if_needed()` — daily archiving with pending extraction
+- `estimate_complexity()` — score 1-5 for model routing
+- `route_model()` — pick model based on complexity
 
-### Plugin metadata
-- `.claude-plugin/plugin.json`: plugin manifest metadata.
+### `cc_later/dispatcher.py`
+Main handler loop:
+1. Acquire lock
+2. Load config/state
+3. Reconcile in-flight dispatches (verify, mark, retry, report, analytics)
+4. Evaluate gate sequence (enabled → watch → idle → peak → budget → mode)
+5. For each repo: parse → filter retries → select → route model → render prompt → spawn
+6. Record analytics, save state
 
-### Hook wiring
-- `hooks/hooks.json`: `Stop` hook command to run `scripts/handler.py` via `python3`.
+### `cc_later/window.py`
+Window state computation from JSONL files, budget tracking, time range utilities, peak window detection.
 
-### Skill
-- `skills/later/SKILL.md`: conventions for writing to `.claude/LATER.md`.
+### `cc_later/analytics.py`
+SQLite engine (`~/.cc-later/analytics.db`):
+- `record_dispatch()` / `record_outcome()` — event recording
+- `get_stats()` — aggregate metrics (success rate, by-model, by-repo, by-section, streak)
+- `import_from_run_log()` — one-time backfill from JSONL
 
-### Slash command
-- `commands/status.md`: instructions to inspect window, gates, queue, and last runs.
+### `cc_later/verify.py`
+Post-dispatch verification:
+- Score result confidence: high/medium/low/none
+- Work signals (modified, fixed, found) vs punt signals (cannot, unable)
+- Task-specific term matching
+- Git diff check when writes enabled
+- Downgrade DONE → NEEDS_HUMAN if below threshold
 
-### Runtime scripts
-- `scripts/default_config.toml`: complete defaults with comments.
-- `scripts/handler.py`: single-file runtime with stdlib only.
-- `scripts/__init__.py`: allows importing `scripts.handler` in tests.
+### `cc_later/reporter.py`
+Report generation:
+- Per-dispatch markdown report → `.claude/reports/later-{date}.md`
+- Analytics dashboard rendering for `/cc-later:stats`
 
-### Tests
-- `tests/test_config.py`: config schema validation, unknown-key rejection.
-- `tests/test_later_entries.py`: LATER parsing, priority ordering, deterministic IDs.
-- `tests/test_window_modes.py`: `window_aware`, `time_based`, `always` gate behavior.
-- `tests/test_completion.py`: result parsing and deterministic LATER completion marking.
-- `tests/test_locking.py`: lock semantics (second acquire fails while held).
+### `cc_later/prompt.py`
+Dispatch prompt rendering:
+- Per-task instruction blocks with contextual hints
+- Verb-based strategy hints (audit → "read thoroughly", fix → "locate first")
+- Section-based hints (security → "high priority", tests → "follow patterns")
+- FAILED status in output format (not just DONE/SKIPPED/NEEDS_HUMAN)
 
-## 5. Handler Internal Design (`scripts/handler.py`)
+### `cc_later/notify.py`
+Desktop notifications (macOS/Linux) + webhook POST (Slack/Discord/custom).
 
-## 5.1 Data model
-- `WindowConfig`, `PathsConfig`, `LaterConfig`, `DispatchConfig`, `NotificationConfig`, `AppConfig`
-- `LaterEntry(id, text, marker, line_index)`
-- `DispatchRecord(repo, entries, model, result_path, pid, ts)`
-- `RepoState(in_flight, dispatch_record)`
-- `AppState(last_hook_ts, repos)`
+### `cc_later/cli.py`
+Subcommands: status, stats, inspect, dispatch, dry-run, init, queue, import-log.
 
-## 5.2 Core pure functions (unit tested)
-- `validate_config_dict(raw: dict) -> AppConfig`
-- `parse_later_entries(content: str, priority_marker: str) -> list[LaterEntry]`
-- `select_entries(entries, max_entries) -> list[LaterEntry]`
-- `render_prompt(...) -> str`
-- `parse_result_summary(text: str) -> dict[id, status]`
-- `apply_completion(content, done_entry_ids, dispatched_entries, mark_mode) -> str`
-- `is_within_time_ranges(now_local, ranges) -> bool`
-- `compute_window_state(jsonl_roots, now_utc) -> WindowState | None`
+## Dispatch Pipeline
 
-## 5.3 Side-effect adapters (thin wrappers)
-- FS adapter: read/write config/state/log/results/LATER.
-- Process adapter: spawn detached `claude -p`.
-- Notification adapter: best-effort desktop notifications.
-- Hook adapter: read stdin payload safely.
+```
+Stop hook → handler.py
+    → cc_later.dispatcher.main()
+        → Acquire lock
+        → Load config + state
+        → Reconcile in-flight:
+            ├── Check process alive
+            ├── Parse result summary
+            ├── Verify result quality
+            │   ├── Score confidence
+            │   └── Downgrade if below threshold
+            ├── Mark completed in LATER.md
+            ├── Update retry metadata for failures
+            ├── Generate dispatch report
+            └── Record analytics outcomes
+        → Gate sequence:
+            ├── dispatch.enabled
+            ├── paths.watch non-empty
+            ├── idle grace period
+            ├── not in peak window
+            ├── budget under threshold
+            └── mode gate (window_aware / time_based / always)
+        → For each repo:
+            ├── Rotate LATER.md if new day
+            ├── Parse entries + retry metadata
+            ├── Filter by retry eligibility (backoff timing)
+            ├── Filter by dependency completion
+            ├── Select top N by priority
+            ├── Route model (fixed or auto by complexity)
+            ├── Render prompt with task hints
+            ├── Spawn detached claude -p
+            └── Record dispatch in analytics + state
+        → Save state + release lock
+```
 
-## 5.4 Execution pipeline
-1. Acquire global lock.
-2. Load/copy config, validate strict schema.
-3. Load state, run completion reconciliation for in-flight repos.
-4. Evaluate global gates (`dispatch.enabled`, `watch`, idle, peak/mode).
-5. For each watched repo: load LATER, collect entries, skip if none/in-flight.
-6. Dispatch selected entries; record state + run log.
-7. Persist updated state and append run log events.
-8. Exit quickly with one-line status.
+## Data Flow
 
-## 6. Test-First Implementation Order
-1. Add failing tests for config schema, LATER parser, window mode gates, completion logic, lock semantics.
-2. Implement pure functions until tests pass.
-3. Implement side-effect wrappers and `main()` glue.
-4. Add integration-like tests for dispatch command construction (without actually running `claude`).
-5. Wire plugin manifests/hooks/skill/command/docs.
+```
+User types "later: fix bug"
+    → UserPromptSubmit hook → capture.py
+    → Auto-detect section → Insert under ## Bugs
+    → Write to .claude/LATER.md
 
-## 7. Acceptance Criteria for v0.1.0
-1. `python3 -m unittest discover -s tests -v` passes.
-2. First run copies config to `~/.cc-later/config.toml` and exits cleanly.
-3. Unknown config keys fail with explicit error and no dispatch.
-4. `dispatch_mode` values behave as documented with graceful fallback.
-5. Duplicate Stop events do not create duplicate dispatches while in-flight.
-6. Completed results mark the intended LATER entries deterministically.
-7. Hook command and plugin install metadata are valid JSON and path-correct.
+Session ends
+    → Stop hook → handler.py → dispatcher.main()
+    → Select entries, route model, spawn claude -p
+
+Background agent completes
+    → Result written to ~/.cc-later/results/
+
+Next Stop hook
+    → Reconcile: verify → mark → retry → report → analytics
+```
+
+## Test Coverage
+
+150 tests across 19 modules covering:
+- Config validation + schema rejection
+- LATER parsing, priority, sections, retry metadata, dependencies
+- Window state computation, budget tracking
+- Completion marking (check/delete modes)
+- Retry logic (backoff, escalation, metadata)
+- Model routing (complexity scoring, auto vs fixed)
+- Verification pipeline (confidence scoring, thresholds)
+- Report generation
+- Analytics (SQLite queries, stats aggregation)
+- Lock semantics, dry-run, status output
+- Capture hook regex + integration
+- Rotation with metadata preservation

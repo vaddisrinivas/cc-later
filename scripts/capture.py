@@ -10,7 +10,8 @@ Triggered by UserPromptSubmit when the user types phrases like:
   add to later: update README install steps
   note for later: UserService.delete() swallows exceptions
   queue for later: add rate limiting to /refresh endpoint
-  later[!]: SQL injection risk in filter builder   ← [!] marks urgent
+  later[!]: SQL injection risk in filter builder   <- [!] marks urgent
+  later: Task B (after: t_abc123)                  <- dependency chain
 """
 
 from __future__ import annotations
@@ -23,15 +24,6 @@ from pathlib import Path
 
 # Matches any key-phrase variant followed by an optional [!] priority flag
 # and a required colon separator, then captures the task text.
-#
-# Supported triggers:
-#   later:                  add to later:       add this to later:
-#   note for later:         note this for later:
-#   queue for later:        queue this for later:
-#   for later:
-#
-# All variants accept an optional [!] before the colon:
-#   later[!]: ...  →  [!] priority entry
 CAPTURE_RE = re.compile(
     r"(?i)"
     r"(?:"
@@ -52,15 +44,66 @@ def _repo_root() -> Path:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=5,
+            capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
             return Path(result.stdout.strip())
     except (OSError, subprocess.TimeoutExpired):
         pass
     return Path.cwd()
+
+
+def _find_section(text: str) -> str | None:
+    """Auto-detect which LATER.md section a task belongs to."""
+    text_lower = text.lower()
+    if any(w in text_lower for w in ("injection", "xss", "auth bypass", "credential", "secret", "vulnerability")):
+        return "Security"
+    if any(w in text_lower for w in ("bug", "crash", "error", "exception", "failure", "broken")):
+        return "Bugs"
+    if any(w in text_lower for w in ("test", "coverage", "assert", "spec")):
+        return "Tests"
+    if any(w in text_lower for w in ("readme", "doc", "docstring", "changelog", "comment")):
+        return "Docs"
+    if any(w in text_lower for w in ("refactor", "cleanup", "dead code", "unused", "rename", "type hint")):
+        return "Refactor"
+    if any(w in text_lower for w in ("audit", "report", "analyze", "survey")):
+        return "Reports"
+    return None
+
+
+def _insert_under_section(content: str, section: str, entry_line: str) -> str:
+    """Insert an entry under the matching ## section, or append to end."""
+    lines = content.splitlines()
+    section_header = f"## {section}"
+
+    # Find the section
+    for i, line in enumerate(lines):
+        if line.strip() == section_header:
+            # Find the end of this section (next ## or end of file)
+            insert_at = i + 1
+            while insert_at < len(lines):
+                if lines[insert_at].startswith("## "):
+                    break
+                if lines[insert_at].strip():
+                    insert_at += 1
+                    continue
+                insert_at += 1
+            # Insert before the next section (or at end of section content)
+            # Back up past trailing blank lines
+            actual = insert_at
+            while actual > i + 1 and not lines[actual - 1].strip():
+                actual -= 1
+            lines.insert(actual, entry_line)
+            result = "\n".join(lines)
+            if not result.endswith("\n"):
+                result += "\n"
+            return result
+
+    # Section not found — append at end
+    if not content.endswith("\n"):
+        content += "\n"
+    content += f"\n{section_header}\n{entry_line}\n"
+    return content
 
 
 def main() -> int:
@@ -91,23 +134,31 @@ def main() -> int:
 
     added: list[str] = []
     for match in matches:
-        priority_flag = match.group(1)  # "[!]" or None
+        priority_flag = match.group(1)
         text = match.group(2).strip().rstrip(".")
         if not text or len(text) < 3:
             continue
 
-        # Skip duplicates — check if this exact text is already in the file
+        # Skip duplicates
         if text.lower() in existing.lower():
             continue
 
         marker = "[!]" if priority_flag else "[ ]"
-        existing += f"- {marker} {text}\n"
+        entry_line = f"- {marker} {text}"
+        section = _find_section(text)
+
+        if section:
+            existing = _insert_under_section(existing, section, entry_line)
+        else:
+            existing += f"{entry_line}\n"
         added.append(text)
 
     if added:
         later_path.write_text(existing, encoding="utf-8")
         for text in added:
-            print(f"[cc-later] Queued for later: {text}")
+            section = _find_section(text)
+            section_info = f" [{section}]" if section else ""
+            print(f"[cc-later] Queued{section_info}: {text}")
 
     return 0
 

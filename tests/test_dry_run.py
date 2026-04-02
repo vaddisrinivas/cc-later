@@ -24,12 +24,13 @@ class DryRunTests(unittest.TestCase):
 
     def test_dry_run_shows_gate_checks(self):
         output = self._invoke_dry_run()
-        self.assertIn("Gate:", output)
+        # New format uses [pass] / [FAIL] instead of Gate:
         self.assertIn("dispatch.enabled", output)
+        self.assertTrue("[pass]" in output or "[FAIL]" in output)
 
     def test_dry_run_does_not_spawn(self):
-        with patch.object(sys, "argv", ["handler.py", "--dry-run"]), patch.object(
-            self.handler, "_spawn_dispatch"
+        with patch.object(sys, "argv", ["handler.py", "--dry-run"]), patch(
+            "cc_later.dispatcher._spawn_dispatch"
         ) as mock_spawn, patch("sys.stdout", new_callable=StringIO):
             self.handler.main()
         mock_spawn.assert_not_called()

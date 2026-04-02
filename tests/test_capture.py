@@ -35,7 +35,7 @@ class CaptureRegexTests(unittest.TestCase):
     def setUpClass(cls):
         cls.capture = load_capture_module()
 
-    def _matches(self, text: str) -> list[tuple[str | None, str]]:
+    def _matches(self, text: str):
         return [
             (m.group(1), m.group(2).strip())
             for m in self.capture.CAPTURE_RE.finditer(text)

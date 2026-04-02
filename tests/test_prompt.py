@@ -45,13 +45,13 @@ class PromptRenderingTests(unittest.TestCase):
         cfg = self._cfg(allow_file_writes=False)
         entries = self._entries(["audit something"])
         prompt = self.handler._render_prompt(Path("/repo"), cfg, entries)
-        self.assertIn("Do not modify files", prompt)
+        self.assertIn("READ-ONLY", prompt)
 
     def test_write_mode_permits_file_modification(self):
         cfg = self._cfg(allow_file_writes=True)
         entries = self._entries(["fix the bug directly"])
         prompt = self.handler._render_prompt(Path("/repo"), cfg, entries)
-        self.assertIn("You may edit files", prompt)
+        self.assertIn("MAY edit files", prompt)
 
     def test_prompt_instructs_done_output_format(self):
         cfg = self._cfg()

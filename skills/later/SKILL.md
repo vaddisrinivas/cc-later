@@ -5,7 +5,7 @@ description: Append out-of-scope but worthwhile follow-up work to .claude/LATER.
 
 # LATER Skill
 
-cc-later runs tasks from `.claude/LATER.md` as headless `claude -p` background jobs when your session window is near expiry. This skill makes you a good writer of those tasks — entries that a future, context-free Claude agent can actually execute.
+cc-later runs tasks from `.claude/LATER.md` as headless `claude -p` background jobs during idle session capacity. This skill makes you a good writer of those tasks — entries that a future, context-free Claude agent can actually execute.
 
 ---
 
@@ -74,90 +74,88 @@ The background agent has no session context. Write every entry as if handing it 
 
 **Weak entries** (don't write these)
 ```markdown
-- [ ] Improve error handling                    ← no target, no location
-- [ ] Refactor the auth module                  ← vague, unbounded
-- [ ] Maybe look at the database queries        ← speculative ("maybe")
-- [ ] Fix all the TODOs                         ← too broad
-- [!] Security issue                            ← no detail for the agent to act on
+- [ ] Improve error handling                    <- no target, no location
+- [ ] Refactor the auth module                  <- vague, unbounded
+- [ ] Maybe look at the database queries        <- speculative ("maybe")
+- [ ] Fix all the TODOs                         <- too broad
+- [!] Security issue                            <- no detail for the agent to act on
 ```
 
 ---
 
-## Priority markers
+## Priority and status markers
 
-**`- [ ]`** — Default. Code health, docs, deps, test gaps, refactors.
+| Marker | Meaning |
+|--------|---------|
+| `- [ ]` | Pending — will be dispatched |
+| `- [!]` | Priority — dispatched first, routed to stronger model in auto mode |
+| `- [x]` | Done — set by handler automatically |
+| `- [?]` | Needs human — failed after max retries, requires manual attention |
 
-**`- [!]`** — Reserved for: security vulnerabilities, data loss risks, production-impacting bugs. Use sparingly. When in doubt, use `[ ]`.
+---
 
-**`- [x]`** — Done. Set by the handler automatically; do not set manually.
+## Task dependencies
+
+Chain tasks that must run in order using `(after: <task_id>)`:
+
+```markdown
+- [ ] Audit auth flow in middleware/auth.py — check for bypass conditions
+- [ ] Fix auth bypass in middleware/auth.py (after: t_abc123) — apply fix from audit
+- [ ] Add tests for auth fix (after: t_def456) — verify the fix
+```
+
+The handler won't dispatch a task until its dependency is marked `[x]`.
+
+---
+
+## Sections
+
+Organise entries under `##` section headers. Use these standard sections:
+
+| Section | When to use | Auto-detected keywords |
+|---------|-------------|----------------------|
+| `## Security` | Injection risks, hardcoded secrets, auth bypasses — always `[!]` | injection, xss, credential, secret |
+| `## Bugs` | Silent failures, wrong behaviour, data loss risks | bug, crash, error, exception |
+| `## Tests` | Missing coverage, always-passing tests, test gap evidence | test, coverage, assert |
+| `## Docs` | README drift, missing docstrings, stale CHANGELOG | readme, doc, docstring, changelog |
+| `## Refactor` | Bounded cleanup: dead code, oversized functions, type hints | refactor, cleanup, dead code, unused |
+| `## Reports` | Audit or analysis tasks that produce a markdown output | audit, report, analyze |
+
+When using key-phrase capture (`later: ...`), entries are auto-sorted into the matching section.
+
+---
+
+## Retry behavior
+
+- Failed tasks are automatically retried with exponential backoff (30m, 2h, 8h)
+- After 3 attempts, the entry is marked `[?]` (needs human attention)
+- Retry metadata is stored as invisible HTML comments — don't delete them
+
+---
+
+## Model routing
+
+When `model_routing = "auto"` in config, tasks are routed based on complexity:
+- Simple tasks (check, remove, update) → haiku or sonnet
+- Complex tasks (audit, refactor, fix) with multi-file scope → opus
+- Security section entries are weighted higher
 
 ---
 
 ## Constraints the background agent operates under
 
-Before filing, mentally check: can a headless `claude -p` do this with only the repo?
-
-| ✓ File it | ✗ Don't file it |
-|-----------|----------------|
+| File it | Don't file it |
+|---------|--------------|
 | Read and report on code | Requires credentials or env secrets |
-| Edit specific files (if `allow_file_writes` is on) | Requires running the app, tests, or build |
+| Edit specific files (if writes on) | Requires running the app, tests, or build |
 | Parse and summarize docs | Requires approval, deployment, or human sign-off |
 | Fix a bounded, locatable bug | Requires interactive clarification |
 | Check README against code | Requires access to external services or APIs |
-
-If a task requires the user's judgment to complete, note it in conversation instead of LATER.md.
 
 ---
 
 ## Volume discipline
 
-- **Max 3 new entries per session.** Quality over quantity — a LATER.md that fills with noise gets ignored.
-- **Check for duplicates** before appending. Scan existing entries; don't re-file something already there.
-- **Don't batch-file everything you see.** Pick the highest-value items. If you notice 10 things, file the 3 most impactful.
-
----
-
-## File location and format
-
-```
-<repo-root>/.claude/LATER.md
-```
-
-If the file doesn't exist, create it with this header:
-
-```markdown
-# LATER
-```
-
-### Sections
-
-Organise entries under `##` section headers. Use these standard sections:
-
-| Section | When to use |
-|---------|-------------|
-| `## Security` | Injection risks, hardcoded secrets, auth bypasses — always `[!]` |
-| `## Bugs` | Silent failures, wrong behaviour, data loss risks |
-| `## Tests` | Missing coverage, always-passing tests, test gap evidence |
-| `## Docs` | README drift, missing docstrings, stale CHANGELOG |
-| `## Refactor` | Bounded cleanup: dead code, oversized functions, type hints |
-| `## Reports` | Audit or analysis tasks that produce a markdown output |
-
-Example well-formed LATER.md:
-
-```markdown
-# LATER
-
-## Security
-- [!] Fix SQL injection in ReportFilter.build_query() (src/reports/filter.py) — user input concatenated directly
-
-## Tests
-- [ ] Add integration tests for MCP runner tool call round-trips (tests/test_mcp_integration.py) — no coverage for timeout case
-- [ ] Add edge case tests for auth flow on Safari — confirmed missing in test/auth.test.ts
-
-## Reports
-- [ ] Generate perf audit from logs/ — output to .claude/reports/perf-{date}.md
-```
-
-If no section fits, append to the closest match or use `## Misc`.
-
-Append new entries under the appropriate section. Never reorder, edit, or delete existing entries unless explicitly asked.
+- **Max 3 new entries per session.** Quality over quantity.
+- **Check for duplicates** before appending.
+- **Don't batch-file everything you see.** Pick the 3 most impactful.

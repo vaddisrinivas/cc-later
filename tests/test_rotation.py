@@ -98,6 +98,31 @@ class RotationTests(unittest.TestCase):
             rotated = self.handler.rotate_later_if_needed(missing, now)
         self.assertFalse(rotated)
 
+    def test_empty_file_rotates_to_header_only(self):
+        now = datetime.now(ZoneInfo("America/New_York"))
+        with tempfile.TemporaryDirectory() as td:
+            later = self._make_later(td, "", days_old=1)
+            rotated = self.handler.rotate_later_if_needed(later, now)
+            self.assertTrue(rotated)
+            fresh = later.read_text(encoding="utf-8")
+            self.assertEqual(fresh, "# LATER\n")
+
+    def test_section_with_only_done_entries_omitted_from_fresh_file(self):
+        now = datetime.now(ZoneInfo("America/New_York"))
+        with tempfile.TemporaryDirectory() as td:
+            content = (
+                "# LATER\n\n"
+                "## Done Section\n- [x] finished a\n- [x] finished b\n\n"
+                "## Pending Section\n- [ ] still todo\n"
+            )
+            later = self._make_later(td, content, days_old=1)
+            self.handler.rotate_later_if_needed(later, now)
+            fresh = later.read_text(encoding="utf-8")
+            self.assertNotIn("Done Section", fresh)
+            self.assertNotIn("finished a", fresh)
+            self.assertIn("Pending Section", fresh)
+            self.assertIn("still todo", fresh)
+
 
 if __name__ == "__main__":
     unittest.main()

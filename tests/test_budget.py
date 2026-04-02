@@ -109,6 +109,38 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(state.tokens_used_this_week, 0)
         self.assertEqual(state.pct_used, 0.0)
 
+    def test_message_usage_cache_creation_tokens_counted(self):
+        """cache_creation_input_tokens inside message_usage is included in the total."""
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "s.jsonl"
+            self._write_jsonl(f, [
+                {"timestamp": now.isoformat(), "message_usage": {
+                    "input_tokens": 1000,
+                    "cache_creation_input_tokens": 500,
+                    "output_tokens": 200,
+                }},
+            ])
+            state = self.handler.compute_budget_state([root], now, weekly_budget=10_000_000)
+        self.assertEqual(state.tokens_used_this_week, 1700)  # 1000+500+200
+
+    def test_message_usage_key_preferred_over_usage_key(self):
+        """message_usage takes priority over usage when both keys are present."""
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "s.jsonl"
+            self._write_jsonl(f, [
+                {
+                    "timestamp": now.isoformat(),
+                    "message_usage": {"input_tokens": 100, "output_tokens": 50},
+                    "usage": {"input_tokens": 9999, "output_tokens": 9999},
+                },
+            ])
+            state = self.handler.compute_budget_state([root], now, weekly_budget=10_000_000)
+        self.assertEqual(state.tokens_used_this_week, 150)
+
 
 if __name__ == "__main__":
     unittest.main()
