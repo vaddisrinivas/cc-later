@@ -7,6 +7,18 @@ dispatch_mode = "window_aware"
 fallback_dispatch_hours = []
 jsonl_paths = []
 
+# Time-aware trigger schedules: different trigger thresholds by time-of-day.
+# Each entry has "hours" (HH:MM-HH:MM, supports overnight) and "remaining_pct"
+# (dispatch when this % of the 5hr window remains). Checked in order, first match wins.
+# Falls back to trigger_at_minutes_remaining when no schedule matches.
+trigger_schedules_enabled = false
+# Example: aggressive at night (trigger at 10% left), conservative otherwise (30% left)
+# trigger_schedules = [
+#   {hours = "01:00-05:00", remaining_pct = 10},
+#   {hours = "05:00-01:00", remaining_pct = 30},
+# ]
+trigger_schedules = []
+
 [paths]
 watch = []
 exclude_patterns = ["node_modules", ".git", "__pycache__", "dist", "build", ".venv", "vendor"]

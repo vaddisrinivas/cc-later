@@ -125,14 +125,26 @@ def cmd_status() -> int:
              budget_ok)
 
         # Mode gate
+        from cc_later.window import resolve_trigger_threshold
+        effective_trigger = resolve_trigger_threshold(
+            now_local=now_local,
+            trigger_at_minutes_remaining=cfg.window.trigger_at_minutes_remaining,
+            trigger_schedules=cfg.window.trigger_schedules,
+            trigger_schedules_enabled=cfg.window.trigger_schedules_enabled,
+        )
+        schedule_note = ""
+        if cfg.window.trigger_schedules_enabled and effective_trigger != cfg.window.trigger_at_minutes_remaining:
+            remaining_pct = int(effective_trigger * 100 / 300)
+            schedule_note = f" (schedule: {remaining_pct}%)"
+
         mode = cfg.window.dispatch_mode
         if mode == "window_aware":
             ws = compute_window_state(roots, now_utc=now_utc)
             if ws is None:
                 gate("mode: window_aware (no JSONL)", False)
             else:
-                gate(f"mode: window_aware ({ws.remaining_minutes}m left <= {cfg.window.trigger_at_minutes_remaining}m trigger)",
-                     ws.remaining_minutes <= cfg.window.trigger_at_minutes_remaining)
+                gate(f"mode: window_aware ({ws.remaining_minutes}m left <= {effective_trigger}m trigger{schedule_note})",
+                     ws.remaining_minutes <= effective_trigger)
         elif mode == "time_based":
             time_ok = is_within_time_ranges(now_local, cfg.window.fallback_dispatch_hours)
             gate(f"mode: time_based ({'in' if time_ok else 'outside'} window)", time_ok)

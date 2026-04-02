@@ -19,6 +19,12 @@ class WindowConfig:
     dispatch_mode: str = "window_aware"
     fallback_dispatch_hours: list[str] = field(default_factory=list)
     jsonl_paths: list[str] = field(default_factory=list)
+    # Time-aware trigger schedules: override trigger threshold by time-of-day.
+    # Each entry: {"hours": "01:00-05:00", "remaining_pct": 10}
+    # During matched hours, dispatch fires when remaining% <= remaining_pct.
+    # Outside all schedules, falls back to trigger_at_minutes_remaining.
+    trigger_schedules: list[dict[str, Any]] = field(default_factory=list)
+    trigger_schedules_enabled: bool = False
 
 
 @dataclass

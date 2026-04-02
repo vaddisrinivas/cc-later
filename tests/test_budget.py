@@ -43,12 +43,13 @@ class BudgetTests(unittest.TestCase):
         self.assertAlmostEqual(state.pct_used, 1850 / 10_000_000, places=8)
 
     def test_compute_budget_state_ignores_files_older_than_7_days(self):
-        now = datetime(2026, 3, 30, 12, 0, tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        old_ts = (now - timedelta(days=10)).isoformat()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             old_file = root / "old.jsonl"
             self._write_jsonl(old_file, [
-                {"timestamp": "2026-03-20T10:00:00Z", "usage": {"input_tokens": 99999, "output_tokens": 99999}},
+                {"timestamp": old_ts, "usage": {"input_tokens": 99999, "output_tokens": 99999}},
             ], mtime_offset_days=10)
             state = self.handler.compute_budget_state([root], now, weekly_budget=10_000_000)
         self.assertEqual(state.tokens_used_this_week, 0)

@@ -34,6 +34,8 @@ SCHEMA: dict[str, set[str]] = {
         "dispatch_mode",
         "fallback_dispatch_hours",
         "jsonl_paths",
+        "trigger_schedules",
+        "trigger_schedules_enabled",
     },
     "paths": {"watch", "exclude_patterns", "max_files_per_scan"},
     "later_md": {

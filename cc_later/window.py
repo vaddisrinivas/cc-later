@@ -123,6 +123,54 @@ def compute_budget_state(
     )
 
 
+def resolve_trigger_threshold(
+    now_local: datetime,
+    trigger_at_minutes_remaining: int,
+    trigger_schedules: list[dict[str, Any]],
+    trigger_schedules_enabled: bool,
+    window_minutes: int = DEFAULT_WINDOW_MINUTES,
+) -> int:
+    """Return the effective trigger threshold in minutes for the current time.
+
+    If trigger_schedules_enabled and a schedule matches the current time,
+    convert its remaining_pct to minutes. Otherwise return the default.
+    """
+    if not trigger_schedules_enabled or not trigger_schedules:
+        return trigger_at_minutes_remaining
+
+    current_minute = now_local.hour * 60 + now_local.minute
+    for schedule in trigger_schedules:
+        if not isinstance(schedule, dict):
+            continue
+        hours = schedule.get("hours", "")
+        if not isinstance(hours, str) or "-" not in hours:
+            continue
+        remaining_pct = schedule.get("remaining_pct")
+        if not isinstance(remaining_pct, (int, float)) or remaining_pct < 0:
+            continue
+
+        start_s, end_s = hours.split("-", 1)
+        try:
+            start = _parse_hhmm(start_s)
+            end = _parse_hhmm(end_s, allow_24=True)
+        except ValueError:
+            continue
+
+        matched = False
+        if start == end:
+            continue
+        if start < end:
+            matched = start <= current_minute < end
+        else:
+            # Overnight window
+            matched = current_minute >= start or current_minute < end
+
+        if matched:
+            return int(window_minutes * remaining_pct / 100)
+
+    return trigger_at_minutes_remaining
+
+
 def should_dispatch_by_mode(
     dispatch_mode: str,
     now_local: datetime,

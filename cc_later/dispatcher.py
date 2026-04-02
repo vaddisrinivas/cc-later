@@ -43,6 +43,7 @@ from .window import (
     is_within_time_ranges,
     parse_iso8601,
     resolve_jsonl_roots,
+    resolve_trigger_threshold,
     should_dispatch_by_mode,
 )
 
@@ -180,12 +181,18 @@ def main() -> int:
                 return 0
 
         remaining = window_state.remaining_minutes if window_state else None
+        effective_trigger = resolve_trigger_threshold(
+            now_local=now_local,
+            trigger_at_minutes_remaining=cfg.window.trigger_at_minutes_remaining,
+            trigger_schedules=cfg.window.trigger_schedules,
+            trigger_schedules_enabled=cfg.window.trigger_schedules_enabled,
+        )
         if not should_dispatch_by_mode(
             dispatch_mode=cfg.window.dispatch_mode,
             now_local=now_local,
             fallback_dispatch_hours=cfg.window.fallback_dispatch_hours,
             remaining_minutes=remaining,
-            trigger_at_minutes_remaining=cfg.window.trigger_at_minutes_remaining,
+            trigger_at_minutes_remaining=effective_trigger,
         ):
             save_state(state)
             log_event("skip", reason="mode_gate_closed", mode=cfg.window.dispatch_mode)
@@ -459,14 +466,24 @@ def _dry_run_report(cfg: AppConfig) -> int:
     gate(f"budget ({budget_state.pct_used*100:.1f}% of {cfg.budget.weekly_token_budget:,}, backoff {cfg.budget.backoff_at_pct}%)",
          budget_state.pct_used < cfg.budget.backoff_at_pct / 100)
 
+    effective_trigger = resolve_trigger_threshold(
+        now_local=now_local,
+        trigger_at_minutes_remaining=cfg.window.trigger_at_minutes_remaining,
+        trigger_schedules=cfg.window.trigger_schedules,
+        trigger_schedules_enabled=cfg.window.trigger_schedules_enabled,
+    )
+    schedule_note = ""
+    if cfg.window.trigger_schedules_enabled and effective_trigger != cfg.window.trigger_at_minutes_remaining:
+        schedule_note = f" (schedule override: {effective_trigger}m)"
+
     mode = cfg.window.dispatch_mode
     if mode == "window_aware":
         ws = compute_window_state(roots, now_utc=now_utc)
         if ws is None:
             gate("mode: window_aware (no JSONL)", False)
         else:
-            gate(f"mode: window_aware ({ws.remaining_minutes}m left, trigger <= {cfg.window.trigger_at_minutes_remaining}m)",
-                 ws.remaining_minutes <= cfg.window.trigger_at_minutes_remaining)
+            gate(f"mode: window_aware ({ws.remaining_minutes}m left, trigger <= {effective_trigger}m{schedule_note})",
+                 ws.remaining_minutes <= effective_trigger)
     elif mode == "time_based":
         time_ok = is_within_time_ranges(now_local, cfg.window.fallback_dispatch_hours)
         gate(f"mode: time_based ({'in' if time_ok else 'outside'} window)", time_ok)

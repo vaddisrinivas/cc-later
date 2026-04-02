@@ -62,6 +62,7 @@ from cc_later.window import (  # noqa: F401
     is_within_time_ranges,
     parse_iso8601 as _parse_iso8601,
     resolve_jsonl_roots as _resolve_jsonl_roots,
+    resolve_trigger_threshold,
     should_dispatch_by_mode,
 )
 from cc_later.dispatcher import (  # noqa: F401
