@@ -531,6 +531,23 @@ def _dry_run_report(cfg: AppConfig) -> int:
 # Side-effect helpers
 # ---------------------------------------------------------------------------
 
+def _find_claude_binary() -> str:
+    """Resolve the claude CLI binary path."""
+    import shutil
+    found = shutil.which("claude")
+    if found:
+        return found
+    # Common install locations not always on PATH in subprocess environments
+    for candidate in [
+        Path.home() / ".local" / "bin" / "claude",
+        Path("/usr/local/bin/claude"),
+        Path.home() / ".claude" / "bin" / "claude",
+    ]:
+        if candidate.exists():
+            return str(candidate)
+    return "claude"  # fall back, will fail at Popen
+
+
 def _spawn_dispatch(
     model: str,
     repo_path: Path,
@@ -538,7 +555,8 @@ def _spawn_dispatch(
     result_path: Path,
     allow_file_writes: bool,
 ) -> int | None:
-    cmd = ["claude", "-p", prompt, "--output-format", "json", "--model", model]
+    claude_bin = _find_claude_binary()
+    cmd = [claude_bin, "-p", prompt, "--output-format", "json", "--model", model]
     if allow_file_writes:
         cmd.append("--dangerously-skip-permissions")
     try:

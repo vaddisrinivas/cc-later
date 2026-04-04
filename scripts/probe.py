@@ -69,9 +69,11 @@ def main() -> int:
                 return 0
 
     # Spawn probe
+    from cc_later.dispatcher import _find_claude_binary
     probe_model = cfg.budget.probe_model
     result_path = APP_DIR / f"probe-{now_utc.strftime('%Y%m%d-%H%M%S')}.json"
-    cmd = ["claude", "-p", ".", "--output-format", "json", "--model", probe_model]
+    claude_bin = _find_claude_binary()
+    cmd = [claude_bin, "-p", ".", "--output-format", "json", "--model", probe_model]
 
     try:
         out_fh = result_path.open("w", encoding="utf-8")
