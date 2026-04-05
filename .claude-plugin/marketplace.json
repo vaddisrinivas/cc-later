@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "Self-hosted marketplace for the cc-later plugin",
-    "version": "0.1.0"
+    "version": "0.3.0"
   },
   "plugins": [
     {
