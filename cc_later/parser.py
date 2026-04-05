@@ -226,9 +226,13 @@ def rotate_later_if_needed(later_path: Path, now_local: datetime) -> bool:
     if not later_path.exists():
         return False
     try:
-        mtime_date = datetime.fromtimestamp(later_path.stat().st_mtime).date()
+        mtime_ts = later_path.stat().st_mtime
     except OSError:
         return False
+    if now_local.tzinfo is not None:
+        mtime_date = datetime.fromtimestamp(mtime_ts, tz=now_local.tzinfo).date()
+    else:
+        mtime_date = datetime.fromtimestamp(mtime_ts).date()
     today = now_local.date()
     if mtime_date >= today:
         return False
