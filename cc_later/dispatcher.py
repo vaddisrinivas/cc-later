@@ -69,6 +69,13 @@ def load_state() -> AppState:
                 pid=_coerce_optional_int(data.get("pid")),
                 entries=data.get("entries", []) if isinstance(data.get("entries"), list) else [],
                 model=_coerce_optional_str(data.get("model")),
+                resume_entries=(
+                    data.get("resume_entries", [])
+                    if isinstance(data.get("resume_entries"), list)
+                    else []
+                ),
+                resume_reason=_coerce_optional_str(data.get("resume_reason")),
+                resume_scheduled_ts=_coerce_optional_str(data.get("resume_scheduled_ts")),
             )
     return AppState(last_hook_ts=_coerce_optional_str(payload.get("last_hook_ts")), repos=repos)
 
@@ -88,6 +95,80 @@ def log_event(event: str, **fields: Any) -> None:
     payload.update(fields)
     with RUN_LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+_LIMIT_EXHAUSTION_MARKERS = (
+    "rate limit",
+    "usage limit",
+    "quota",
+    "too many requests",
+    "429",
+    "window is full",
+    "window has been exhausted",
+    "5-hour window",
+    "try again in",
+    "please try again later",
+)
+
+
+def _detect_limit_exhaustion(raw: str) -> str | None:
+    text = raw.lower()
+    if any(marker in text for marker in _LIMIT_EXHAUSTION_MARKERS):
+        return "limit_exhausted"
+    return None
+
+
+def _is_auto_resume_gate_open(
+    cfg: AppConfig,
+    state: AppState,
+    watch_repo_paths: list[str],
+    window_state: WindowState | None,
+) -> bool:
+    if not cfg.auto_resume.enabled:
+        return False
+    has_pending = any(
+        bool(state.repos.get(repo_key, RepoState()).resume_entries)
+        for repo_key in watch_repo_paths
+    )
+    if not has_pending:
+        return False
+    if cfg.window.dispatch_mode == "window_aware":
+        if window_state is None:
+            return False
+        return window_state.remaining_minutes >= cfg.auto_resume.min_remaining_minutes
+    return True
+
+
+def _clear_auto_resume(repo_state: RepoState) -> None:
+    repo_state.resume_entries = []
+    repo_state.resume_reason = None
+    repo_state.resume_scheduled_ts = None
+
+
+def _select_resume_entries(
+    repo_state: RepoState,
+    later_path: Path,
+    priority_marker: str,
+) -> list[LaterEntry]:
+    stored: list[LaterEntry] = []
+    for item in repo_state.resume_entries:
+        if isinstance(item, dict):
+            stored.append(LaterEntry.from_dict(item))
+    if not stored:
+        return []
+
+    content = _safe_read(later_path)
+    if content is None:
+        return stored
+
+    current_entries = parse_later_entries(content, priority_marker=priority_marker)
+    current_by_id = {entry.id: entry for entry in current_entries}
+    selected: list[LaterEntry] = []
+    for stored_entry in stored:
+        current = current_by_id.get(stored_entry.id)
+        if current is not None:
+            selected.append(current)
+    return selected
 
 
 def main() -> int:
@@ -144,6 +225,13 @@ def main() -> int:
             print("[cc-later] No watched paths configured.")
             db.close()
             return 0
+        watch_paths = expand_watch_paths(cfg.paths.watch)
+        if not watch_paths:
+            save_state(state)
+            log_event("skip", reason="invalid_watch_list")
+            print("[cc-later] No valid watched paths after expansion.")
+            db.close()
+            return 0
 
         if previous_hook_ts is not None:
             if now_utc - previous_hook_ts < timedelta(minutes=cfg.window.idle_grace_period_minutes):
@@ -187,13 +275,20 @@ def main() -> int:
             trigger_schedules=cfg.window.trigger_schedules,
             trigger_schedules_enabled=cfg.window.trigger_schedules_enabled,
         )
-        if not should_dispatch_by_mode(
+        mode_gate_open = should_dispatch_by_mode(
             dispatch_mode=cfg.window.dispatch_mode,
             now_local=now_local,
             fallback_dispatch_hours=cfg.window.fallback_dispatch_hours,
             remaining_minutes=remaining,
             trigger_at_minutes_remaining=effective_trigger,
-        ):
+        )
+        resume_gate_open = _is_auto_resume_gate_open(
+            cfg=cfg,
+            state=state,
+            watch_repo_paths=[str(p) for p in watch_paths],
+            window_state=window_state,
+        )
+        if not mode_gate_open and not resume_gate_open:
             save_state(state)
             log_event("skip", reason="mode_gate_closed", mode=cfg.window.dispatch_mode)
             print("[cc-later] Dispatch gate closed for current mode.")
@@ -202,7 +297,7 @@ def main() -> int:
 
         # --- Dispatch loop ---
         dispatched_count = 0
-        for repo_path in expand_watch_paths(cfg.paths.watch):
+        for repo_path in watch_paths:
             repo_key = str(repo_path)
             repo_state = state.repos.get(repo_key, RepoState())
             state.repos[repo_key] = repo_state
@@ -211,40 +306,58 @@ def main() -> int:
                 continue
 
             later_path = repo_path / cfg.later_md.path
-            if not later_path.exists():
-                continue
+            used_auto_resume = False
+            auto_resume_reason: str | None = None
+            selected: list[LaterEntry] = []
+            if resume_gate_open and repo_state.resume_entries:
+                selected = _select_resume_entries(
+                    repo_state=repo_state,
+                    later_path=later_path,
+                    priority_marker=cfg.later_md.priority_marker,
+                )
+                if selected:
+                    used_auto_resume = True
+                    auto_resume_reason = repo_state.resume_reason
+                else:
+                    _clear_auto_resume(repo_state)
 
-            if cfg.later_md.auto_gitignore:
-                _ensure_gitignore_entry(repo_path, cfg.later_md.path)
-
-            rotated = rotate_later_if_needed(later_path, now_local)
-            if rotated:
-                log_event("rotated", repo=repo_key)
-
-            content = _safe_read(later_path)
-            if content is None:
-                continue
-
-            entries = parse_later_entries(content, priority_marker=cfg.later_md.priority_marker)
-
-            # Filter by retry eligibility
-            if cfg.retry.enabled:
-                eligible = []
-                for e in entries:
-                    if e.attempts >= cfg.retry.max_attempts:
-                        continue
-                    if e.last_attempt and cfg.retry.backoff_minutes:
-                        backoff_idx = min(e.attempts, len(cfg.retry.backoff_minutes) - 1)
-                        backoff_min = cfg.retry.backoff_minutes[backoff_idx]
-                        last_ts = parse_iso8601(e.last_attempt)
-                        if last_ts and now_utc - last_ts < timedelta(minutes=backoff_min):
-                            continue
-                    eligible.append(e)
-                entries = eligible
-
-            selected = select_entries(entries, cfg.later_md.max_entries_per_dispatch)
             if not selected:
-                continue
+                if not mode_gate_open:
+                    continue
+                if not later_path.exists():
+                    continue
+
+                if cfg.later_md.auto_gitignore:
+                    _ensure_gitignore_entry(repo_path, cfg.later_md.path)
+
+                rotated = rotate_later_if_needed(later_path, now_local)
+                if rotated:
+                    log_event("rotated", repo=repo_key)
+
+                content = _safe_read(later_path)
+                if content is None:
+                    continue
+
+                entries = parse_later_entries(content, priority_marker=cfg.later_md.priority_marker)
+
+                # Filter by retry eligibility
+                if cfg.retry.enabled:
+                    eligible = []
+                    for e in entries:
+                        if e.attempts >= cfg.retry.max_attempts:
+                            continue
+                        if e.last_attempt and cfg.retry.backoff_minutes:
+                            backoff_idx = min(e.attempts, len(cfg.retry.backoff_minutes) - 1)
+                            backoff_min = cfg.retry.backoff_minutes[backoff_idx]
+                            last_ts = parse_iso8601(e.last_attempt)
+                            if last_ts and now_utc - last_ts < timedelta(minutes=backoff_min):
+                                continue
+                        eligible.append(e)
+                    entries = eligible
+
+                selected = select_entries(entries, cfg.later_md.max_entries_per_dispatch)
+                if not selected:
+                    continue
 
             # Model routing: pick best model per task (use highest complexity for batch)
             if cfg.dispatch.model_routing == "auto":
@@ -269,6 +382,8 @@ def main() -> int:
             repo_state.pid = pid
             repo_state.entries = [e.to_dict() for e in selected]
             repo_state.model = model
+            if used_auto_resume:
+                _clear_auto_resume(repo_state)
             dispatched_count += 1
 
             # Record in analytics
@@ -291,11 +406,26 @@ def main() -> int:
                 remaining_minutes=remaining,
                 model=model,
                 result_path=str(result_path),
+                auto_resume=used_auto_resume,
             )
+            if used_auto_resume:
+                log_event(
+                    "resume_dispatch",
+                    repo=repo_key,
+                    entries_dispatched=len(selected),
+                    entries=[e.text for e in selected],
+                    reason=auto_resume_reason or "limit_exhausted",
+                    remaining_minutes=remaining,
+                    model=model,
+                )
             notify(
                 cfg.notifications,
                 "cc-later",
-                f"Dispatched {len(selected)} task(s) in {repo_path.name} via {model}",
+                (
+                    f"Auto-resumed {len(selected)} task(s) in {repo_path.name} via {model}"
+                    if used_auto_resume
+                    else f"Dispatched {len(selected)} task(s) in {repo_path.name} via {model}"
+                ),
                 "dispatch",
                 {"repo": repo_path.name, "model": model, "tasks": [e.text for e in selected]},
             )
@@ -350,6 +480,30 @@ def _reconcile_in_flight(cfg: AppConfig, state: AppState, db: AnalyticsDB) -> in
 
         summary = parse_result_summary(raw)
         dispatched_entries = [LaterEntry.from_dict(e) for e in repo_state.entries if isinstance(e, dict)]
+        for entry in dispatched_entries:
+            summary.setdefault(entry.id, "FAILED")
+
+        limit_reason = _detect_limit_exhaustion(raw)
+        auto_resume_ids: set[str] = set()
+        if cfg.auto_resume.enabled and limit_reason and dispatched_entries:
+            auto_resume_ids = {
+                task_id for task_id, status in summary.items()
+                if status in ("FAILED", "NEEDS_HUMAN")
+            }
+            if auto_resume_ids:
+                resume_entries = [e for e in dispatched_entries if e.id in auto_resume_ids]
+                if resume_entries:
+                    repo_state.resume_entries = [e.to_dict() for e in resume_entries]
+                    repo_state.resume_reason = limit_reason
+                    repo_state.resume_scheduled_ts = now_iso
+                    for task_id in auto_resume_ids:
+                        summary[task_id] = "SKIPPED"
+                    log_event(
+                        "resume_scheduled",
+                        repo=repo_key,
+                        reason=limit_reason,
+                        entries=[e.text for e in resume_entries],
+                    )
 
         # Verification pipeline
         verify_results = {}
@@ -424,6 +578,11 @@ def _reconcile_in_flight(cfg: AppConfig, state: AppState, db: AnalyticsDB) -> in
                 task_id=entry.id,
                 repo=repo_key,
                 status=status,
+                error=(
+                    f"auto_resume:{limit_reason}"
+                    if entry.id in auto_resume_ids and limit_reason
+                    else None
+                ),
             )
 
         repo_state.in_flight = False
@@ -440,6 +599,7 @@ def _dry_run_report(cfg: AppConfig) -> int:
     state = load_state()
     now_utc = datetime.now(timezone.utc)
     now_local = now_utc.astimezone()
+    watch_paths = expand_watch_paths(cfg.paths.watch)
 
     print("[cc-later --dry-run]\n")
 
@@ -477,11 +637,13 @@ def _dry_run_report(cfg: AppConfig) -> int:
         schedule_note = f" (schedule override: {effective_trigger}m)"
 
     mode = cfg.window.dispatch_mode
+    window_state_for_resume: WindowState | None = None
     if mode == "window_aware":
         ws = compute_window_state(roots, now_utc=now_utc)
         if ws is None:
             gate("mode: window_aware (no JSONL)", False)
         else:
+            window_state_for_resume = ws
             gate(f"mode: window_aware ({ws.remaining_minutes}m left, trigger <= {effective_trigger}m{schedule_note})",
                  ws.remaining_minutes <= effective_trigger)
     elif mode == "time_based":
@@ -489,13 +651,31 @@ def _dry_run_report(cfg: AppConfig) -> int:
         gate(f"mode: time_based ({'in' if time_ok else 'outside'} window)", time_ok)
     else:
         gate("mode: always", True)
+    auto_resume_open = _is_auto_resume_gate_open(
+        cfg=cfg,
+        state=state,
+        watch_repo_paths=[str(p) for p in watch_paths],
+        window_state=window_state_for_resume,
+    )
+    gate(
+        (
+            "auto-resume gate "
+            f"({'open' if auto_resume_open else 'closed'}, "
+            f"min {cfg.auto_resume.min_remaining_minutes}m)"
+        ),
+        auto_resume_open if cfg.auto_resume.enabled else True,
+    )
 
     print(f"\n  Model routing: {cfg.dispatch.model_routing} (default: {cfg.dispatch.model})")
     print(f"  Retry: {'enabled' if cfg.retry.enabled else 'disabled'} (max {cfg.retry.max_attempts} attempts)")
+    print(
+        f"  Auto-resume: {'enabled' if cfg.auto_resume.enabled else 'disabled'} "
+        f"(min remaining {cfg.auto_resume.min_remaining_minutes}m)"
+    )
     print(f"  Verify: {'enabled' if cfg.verify.enabled else 'disabled'} (min confidence: {cfg.verify.min_confidence})")
 
     print()
-    for repo_path in expand_watch_paths(cfg.paths.watch):
+    for repo_path in watch_paths:
         repo_key = str(repo_path)
         repo_state = state.repos.get(repo_key, RepoState())
         later_path = repo_path / cfg.later_md.path

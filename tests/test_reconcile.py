@@ -18,6 +18,14 @@ class ReconcileTests(unittest.TestCase):
             {"later_md": {"mark_completed": mark_completed}}
         )
 
+    def _cfg_auto_resume(self, enabled: bool):
+        return self.handler.validate_config_dict(
+            {
+                "later_md": {"mark_completed": "check"},
+                "auto_resume": {"enabled": enabled, "min_remaining_minutes": 240},
+            }
+        )
+
     def _mock_db(self):
         db = MagicMock()
         db.record_outcome = MagicMock()
@@ -93,6 +101,101 @@ class ReconcileTests(unittest.TestCase):
             updated = later_path.read_text(encoding="utf-8")
             self.assertIn("- [x] fix the bug", updated)
             self.assertIn("- [ ] update docs", updated)
+
+    def test_limit_failure_schedules_auto_resume(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            later_dir = repo / ".claude"
+            later_dir.mkdir()
+            later_path = later_dir / "LATER.md"
+            later_path.write_text("- [ ] fix auth timeout\n", encoding="utf-8")
+
+            content = "- [ ] fix auth timeout\n"
+            entry = self.handler.parse_later_entries(content)[0]
+
+            result_file = repo / "result.json"
+            result_file.write_text(
+                "Rate limit reached for your current 5-hour window. Try again later.\n",
+                encoding="utf-8",
+            )
+
+            state = self.handler.AppState()
+            state.repos[str(repo)] = self.handler.RepoState(
+                in_flight=True,
+                pid=12345,
+                result_path=str(result_file),
+                entries=[{
+                    "id": entry.id,
+                    "text": entry.text,
+                    "is_priority": entry.is_priority,
+                    "line_index": entry.line_index,
+                    "raw_line": entry.raw_line,
+                }],
+            )
+
+            db = self._mock_db()
+            with patch("cc_later.dispatcher._is_process_alive", return_value=False):
+                completed = self.handler._reconcile_in_flight(
+                    self._cfg_auto_resume(True),
+                    state,
+                    db,
+                )
+
+            self.assertEqual(completed, 1)
+            repo_state = state.repos[str(repo)]
+            self.assertFalse(repo_state.in_flight)
+            self.assertEqual(len(repo_state.resume_entries), 1)
+            self.assertIsNotNone(repo_state.resume_reason)
+            db.record_outcome.assert_called_with(
+                task_id=entry.id,
+                repo=str(repo),
+                status="SKIPPED",
+                error="auto_resume:limit_exhausted",
+            )
+
+    def test_limit_failure_does_not_schedule_when_auto_resume_disabled(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            later_dir = repo / ".claude"
+            later_dir.mkdir()
+            later_path = later_dir / "LATER.md"
+            later_path.write_text("- [ ] fix auth timeout\n", encoding="utf-8")
+
+            content = "- [ ] fix auth timeout\n"
+            entry = self.handler.parse_later_entries(content)[0]
+
+            result_file = repo / "result.json"
+            result_file.write_text(
+                "Rate limit reached for your current 5-hour window. Try again later.\n",
+                encoding="utf-8",
+            )
+
+            state = self.handler.AppState()
+            state.repos[str(repo)] = self.handler.RepoState(
+                in_flight=True,
+                pid=12345,
+                result_path=str(result_file),
+                entries=[{
+                    "id": entry.id,
+                    "text": entry.text,
+                    "is_priority": entry.is_priority,
+                    "line_index": entry.line_index,
+                    "raw_line": entry.raw_line,
+                }],
+            )
+
+            db = self._mock_db()
+            with patch("cc_later.dispatcher._is_process_alive", return_value=False):
+                completed = self.handler._reconcile_in_flight(
+                    self._cfg_auto_resume(False),
+                    state,
+                    db,
+                )
+
+            self.assertEqual(completed, 1)
+            repo_state = state.repos[str(repo)]
+            self.assertFalse(repo_state.in_flight)
+            self.assertEqual(len(repo_state.resume_entries), 0)
 
 
 if __name__ == "__main__":

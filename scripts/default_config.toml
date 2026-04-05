@@ -70,6 +70,12 @@ backoff_minutes = [30, 120, 480]
 # After max_attempts, mark as [?] (needs human) instead of retrying forever
 escalate_to_priority = true
 
+[auto_resume]
+# Automatically resume tasks that failed because Claude hit usage/rate limits.
+enabled = false
+# In window_aware mode, only resume when a fresh window has at least this much time left.
+min_remaining_minutes = 240
+
 [verify]
 # Verify dispatch results before marking as DONE
 enabled = true

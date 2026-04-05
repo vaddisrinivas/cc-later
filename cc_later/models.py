@@ -94,6 +94,13 @@ class RetryConfig:
 
 
 @dataclass
+class AutoResumeConfig:
+    enabled: bool = False
+    # In window_aware mode, only resume when a fresh window has this much room left.
+    min_remaining_minutes: int = 240
+
+
+@dataclass
 class VerifyConfig:
     enabled: bool = True
     require_diff: bool = False  # only when allow_file_writes is on
@@ -110,6 +117,7 @@ class AppConfig:
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     retry: RetryConfig = field(default_factory=RetryConfig)
+    auto_resume: AutoResumeConfig = field(default_factory=AutoResumeConfig)
     verify: VerifyConfig = field(default_factory=VerifyConfig)
 
 
@@ -178,6 +186,9 @@ class RepoState:
     pid: int | None = None
     entries: list[dict[str, Any]] = field(default_factory=list)
     model: str | None = None
+    resume_entries: list[dict[str, Any]] = field(default_factory=list)
+    resume_reason: str | None = None
+    resume_scheduled_ts: str | None = None
 
 
 @dataclass

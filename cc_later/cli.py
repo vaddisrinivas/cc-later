@@ -66,8 +66,10 @@ def cmd_status() -> int:
         print(f"Config error: {cfg_err}\n")
     else:
         mode = cfg.window.dispatch_mode
+        roots = resolve_jsonl_roots(cfg.window)
+        budget_state = compute_budget_state(roots, now_utc, cfg.budget.weekly_token_budget)
+        backoff_tokens = int(cfg.budget.weekly_token_budget * cfg.budget.backoff_at_pct / 100)
         if mode == "window_aware":
-            roots = resolve_jsonl_roots(cfg.window)
             ws = compute_window_state(roots, now_utc=now_utc)
             if ws is None:
                 print(f"  Mode: {mode}")
@@ -95,6 +97,14 @@ def cmd_status() -> int:
             print(f"  Mode: {mode} — {state_str}")
         else:
             print(f"  Mode: {mode} — dispatches whenever idle")
+        print(
+            f"  Weekly budget: {budget_state.tokens_used_this_week:,} / "
+            f"{cfg.budget.weekly_token_budget:,} ({budget_state.pct_used*100:.1f}%)"
+        )
+        print(
+            f"  Backoff at: {cfg.budget.backoff_at_pct}% "
+            f"({backoff_tokens:,} tokens)"
+        )
     print()
 
     # ── Gates ──
@@ -161,7 +171,14 @@ def cmd_status() -> int:
         else:
             gate("mode: always", True)
 
-        print(f"\n  Routing: {cfg.dispatch.model_routing} | Retry: {'on' if cfg.retry.enabled else 'off'} | Verify: {'on' if cfg.verify.enabled else 'off'}")
+        print(
+            "\n  Routing: "
+            f"{cfg.dispatch.model_routing} | "
+            f"Retry: {'on' if cfg.retry.enabled else 'off'} | "
+            f"Auto-resume: {'on' if cfg.auto_resume.enabled else 'off'} "
+            f"(min {cfg.auto_resume.min_remaining_minutes}m) | "
+            f"Verify: {'on' if cfg.verify.enabled else 'off'}"
+        )
     print()
 
     # ── Queue ──

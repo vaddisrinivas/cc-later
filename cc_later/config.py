@@ -19,6 +19,7 @@ from .models import (
     NotificationConfig,
     BudgetConfig,
     RetryConfig,
+    AutoResumeConfig,
     VerifyConfig,
 )
 from .paths import APP_DIR, CONFIG_PATH, DEFAULT_CONFIG_PATH
@@ -65,6 +66,7 @@ SCHEMA: dict[str, set[str]] = {
     },
     "budget": {"plan", "weekly_token_budget", "backoff_at_pct", "probe_model"},
     "retry": {"enabled", "max_attempts", "backoff_minutes", "escalate_to_priority"},
+    "auto_resume": {"enabled", "min_remaining_minutes"},
     "verify": {"enabled", "require_diff", "min_confidence"},
 }
 
@@ -94,6 +96,7 @@ def validate_config_dict(raw: dict[str, Any]) -> AppConfig:
     _merge_dataclass(cfg.notifications, raw.get("notifications", {}))
     _merge_dataclass(cfg.budget, raw.get("budget", {}))
     _merge_dataclass(cfg.retry, raw.get("retry", {}))
+    _merge_dataclass(cfg.auto_resume, raw.get("auto_resume", {}))
     _merge_dataclass(cfg.verify, raw.get("verify", {}))
 
     # Value constraints
@@ -107,6 +110,8 @@ def validate_config_dict(raw: dict[str, Any]) -> AppConfig:
         raise ConfigError("dispatch.model_routing must be one of: fixed, auto")
     if cfg.verify.min_confidence not in {"low", "medium", "high"}:
         raise ConfigError("verify.min_confidence must be one of: low, medium, high")
+    if not isinstance(cfg.auto_resume.min_remaining_minutes, int) or cfg.auto_resume.min_remaining_minutes < 0:
+        raise ConfigError("auto_resume.min_remaining_minutes must be an integer >= 0")
     for field_name in ("watch", "exclude_patterns", "fallback_dispatch_hours", "jsonl_paths"):
         obj = cfg.paths if hasattr(cfg.paths, field_name) else cfg.window
         val = getattr(obj, field_name)

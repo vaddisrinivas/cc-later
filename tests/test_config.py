@@ -78,6 +78,13 @@ class ConfigValidationTests(unittest.TestCase):
             )
             self.assertEqual(cfg.dispatch.model, model)
 
+    def test_accepts_auto_resume_section(self):
+        cfg = self.handler.validate_config_dict(
+            {"auto_resume": {"enabled": True, "min_remaining_minutes": 240}}
+        )
+        self.assertTrue(cfg.auto_resume.enabled)
+        self.assertEqual(cfg.auto_resume.min_remaining_minutes, 240)
+
 
 if __name__ == "__main__":
     unittest.main()

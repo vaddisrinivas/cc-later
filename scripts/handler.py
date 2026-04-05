@@ -32,6 +32,7 @@ from cc_later.models import (  # noqa: F401
     PathsConfig,
     RepoState,
     RetryConfig,
+    AutoResumeConfig,
     SkillConfig,
     VerifyConfig,
     WindowConfig,
@@ -66,6 +67,7 @@ from cc_later.window import (  # noqa: F401
     should_dispatch_by_mode,
 )
 from cc_later.dispatcher import (  # noqa: F401
+    _is_auto_resume_gate_open,
     _reconcile_in_flight,
     _is_process_alive,
     load_state,
