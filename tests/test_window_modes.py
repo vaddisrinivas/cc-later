@@ -167,6 +167,30 @@ class WindowModeTests(unittest.TestCase):
             state = self.handler.compute_window_state([root], now_utc=now)
         self.assertIsNone(state)
 
+    def test_window_state_ignores_stale_rows_in_recent_file(self):
+        """Rows older than 5 hours must be ignored even if file mtime is recent."""
+        now = datetime(2026, 3, 30, 12, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "mixed.jsonl"
+            rows = [
+                {
+                    "timestamp": "2026-03-30T04:30:00Z",  # stale
+                    "usage": {"input_tokens": 999, "output_tokens": 999},
+                },
+                {
+                    "timestamp": "2026-03-30T10:00:00Z",  # in-window
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            ]
+            f.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            state = self.handler.compute_window_state([root], now_utc=now)
+        self.assertIsNotNone(state)
+        self.assertEqual(state.elapsed_minutes, 120)
+        self.assertEqual(state.remaining_minutes, 180)
+        self.assertEqual(state.total_input_tokens, 10)
+        self.assertEqual(state.total_output_tokens, 5)
+
     def test_time_ranges_empty_list_returns_false(self):
         now = datetime(2026, 3, 30, 2, 0, tzinfo=ZoneInfo("America/New_York"))
         self.assertFalse(self.handler.is_within_time_ranges(now, []))

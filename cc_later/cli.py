@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -72,13 +72,23 @@ def cmd_status() -> int:
             if ws is None:
                 print(f"  Mode: {mode}")
                 print("  State: unknown (no JSONL data)")
+                print("  Next window: starts on your next Claude request")
             else:
                 total = ws.elapsed_minutes + ws.remaining_minutes
                 pct = 100 * ws.elapsed_minutes // total if total else 0
                 bar = _progress_bar(pct, 20)
+                end_local = (now_utc + timedelta(minutes=ws.remaining_minutes)).astimezone()
                 print(f"  Mode: {mode}")
                 print(f"  {bar} {ws.elapsed_minutes}m elapsed / {ws.remaining_minutes}m remaining")
                 print(f"  Tokens: {ws.total_input_tokens:,} in / {ws.total_output_tokens:,} out")
+                print(f"  Window ends: {end_local.strftime('%Y-%m-%d %H:%M %Z')}")
+                if ws.remaining_minutes <= 0:
+                    print("  Next window: starts on your next Claude request")
+                else:
+                    print(
+                        "  Next window: starts on your first Claude request "
+                        f"after {end_local.strftime('%H:%M %Z')}"
+                    )
         elif mode == "time_based":
             in_window = is_within_time_ranges(now_local, cfg.window.fallback_dispatch_hours)
             state_str = "IN dispatch window" if in_window else "outside dispatch window"

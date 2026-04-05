@@ -25,6 +25,9 @@ def compute_window_state(
     session_id: str | None = None,
 ) -> WindowState | None:
     """Compute window state from JSONL files."""
+    window_cutoff = now_utc - timedelta(hours=5)
+    # Allow small clock skew from local log writers.
+    future_cutoff = now_utc + timedelta(minutes=5)
     earliest: datetime | None = None
     input_tokens = 0
     output_tokens = 0
@@ -38,7 +41,7 @@ def compute_window_state(
         if not files:
             continue
 
-        root_had_recent = False
+        root_had_window_rows = False
         for file_path in files:
             if session_id is not None:
                 if session_id not in file_path.stem and session_id not in str(file_path):
@@ -49,11 +52,13 @@ def compute_window_state(
                 continue
             if now_utc - mtime > timedelta(hours=5):
                 continue
-            root_had_recent = True
             for row in _iter_jsonl(file_path):
                 ts = _extract_timestamp(row)
                 if ts is None:
                     continue
+                if ts < window_cutoff or ts > future_cutoff:
+                    continue
+                root_had_window_rows = True
                 if earliest is None or ts < earliest:
                     earliest = ts
                 usage = row.get("message_usage") or row.get("usage") or {}
@@ -65,7 +70,7 @@ def compute_window_state(
                     sid = row.get("sessionId") or row.get("session_id")
                     if sid:
                         matched_session_id = str(sid)
-        if root_had_recent and selected_source is None:
+        if root_had_window_rows and selected_source is None:
             selected_source = str(root)
 
     if earliest is None:
