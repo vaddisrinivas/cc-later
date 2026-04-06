@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -180,6 +182,24 @@ def state_path() -> Path:
     return app_dir() / "state.json"
 
 
+@contextlib.contextmanager
+def _flock(name: str):
+    """Process-level advisory lock scoped to app_dir.
+
+    Prevents concurrent hooks (e.g. two Claude sessions) from corrupting
+    shared resources like state.json or running simultaneous git merges.
+    """
+    lock_path = app_dir() / f".{name}.lock"
+    app_dir().mkdir(parents=True, exist_ok=True)
+    fd = lock_path.open("w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+
+
 def run_log_path() -> Path:
     return app_dir() / "run_log.jsonl"
 
@@ -229,10 +249,14 @@ def _validate_values(cfg: Config) -> None:
         raise ValueError("limits.weekly_budget_tokens must be > 0")
     if not (0 <= cfg.limits.backoff_at_pct <= 100):
         raise ValueError("limits.backoff_at_pct must be between 0 and 100")
+    if cfg.window.duration_minutes <= 0:
+        raise ValueError("window.duration_minutes must be > 0")
     if cfg.auto_resume.min_remaining_minutes < 0:
         raise ValueError("auto_resume.min_remaining_minutes must be >= 0")
     if cfg.later.max_entries_per_dispatch <= 0:
         raise ValueError("later.max_entries_per_dispatch must be > 0")
+    if os.path.isabs(cfg.later.path):
+        raise ValueError("later.path must be a relative path (joined with repo root), not absolute")
     if cfg.plan not in PLAN_WINDOW_MINUTES:
         raise ValueError(f"plan must be one of: {', '.join(sorted(PLAN_WINDOW_MINUTES))}")
 
@@ -341,7 +365,13 @@ def save_state(state: State) -> None:
         "window_limit_ts": state.window_limit_ts,
         "repos": {repo: asdict(repo_state) for repo, repo_state in state.repos.items()},
     }
-    state_path().write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    # Atomic write under advisory lock to prevent corruption from
+    # concurrent hooks (e.g. two Claude sessions stopping simultaneously).
+    with _flock("state"):
+        target = state_path()
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(target)
 
 
 def _safe_read(path: Path) -> str | None:
@@ -443,9 +473,11 @@ def mark_done_in_content(content: str, done_ids: set[str]) -> str:
             continue
         prio = m.group("prio") or ("(P0)" if m.group("mark") == "!" else "")
         out.append(f"{m.group('prefix')}[x] {prio + ' ' if prio else ''}{text}".rstrip())
-    data = "\n".join(out)
-    if content.endswith("\n"):
-        data += "\n"
+    # Detect the line ending style used in the original content.
+    line_sep = "\r\n" if "\r\n" in content else "\n"
+    data = line_sep.join(out)
+    if content.endswith(("\n", "\r\n")):
+        data += line_sep
     return data
 
 
@@ -589,8 +621,10 @@ def compute_window_state(roots: list[Path], now_utc: datetime, session_id: str |
     max_start = now_utc - timedelta(minutes=window_duration)
 
     if window_start_hint is not None and window_start_hint > max_start:
-        # Use the known window start from auto-resume
-        earliest = window_start_hint
+        # Use the known window start from auto-resume.
+        # Clamp to now_utc so a future hint (clock skew) doesn't produce
+        # negative elapsed time or filter out all rows.
+        earliest = min(window_start_hint, now_utc)
     else:
         # Use gap detection, but clamp so window never exceeds duration
         earliest = max(gap_start, max_start)
@@ -671,16 +705,33 @@ def _spawn_dispatch(cfg: Config, repo_path: Path, prompt: str, result_path: Path
     cmd = [_find_claude_bin(), "-p", prompt, "--output-format", "json", "--model", cfg.dispatch.model]
     if cfg.dispatch.allow_file_writes:
         cmd.append("--dangerously-skip-permissions")
+    # Guard against prompts that exceed OS ARG_MAX (~256KB macOS, ~2MB Linux).
+    # When the prompt is large, write it to a temp file and pipe via stdin instead.
+    _ARG_MAX_SAFE = 200_000  # conservative limit in bytes
+    use_stdin = len(prompt.encode("utf-8")) > _ARG_MAX_SAFE
+    if use_stdin:
+        cmd = [_find_claude_bin(), "--output-format", "json", "--model", cfg.dispatch.model]
+        if cfg.dispatch.allow_file_writes:
+            cmd.append("--dangerously-skip-permissions")
     try:
         fh = result_path.open("w", encoding="utf-8")
         proc = subprocess.Popen(
             cmd,
             cwd=str(cwd if cwd is not None else repo_path),
+            stdin=subprocess.PIPE if use_stdin else subprocess.DEVNULL,
             stdout=fh,
             stderr=subprocess.STDOUT,
             start_new_session=True,
             text=True,
         )
+        if use_stdin:
+            # Write prompt to stdin and close (non-blocking for the parent).
+            # The child process will read until EOF.
+            try:
+                proc.stdin.write(prompt)  # type: ignore[union-attr]
+                proc.stdin.close()  # type: ignore[union-attr]
+            except OSError:
+                pass
     except OSError:
         return None
     finally:
@@ -741,7 +792,9 @@ def _auto_resume_gate_open(cfg: Config, watch_paths: list[Path], state: State, w
 
 def _result_path(template: str, repo: Path, now_utc: datetime, section_slug: str = "") -> Path:
     name = f"{repo.name}-{section_slug}" if section_slug else repo.name
-    return Path(template.format(repo=name, date=now_utc.strftime("%Y%m%d-%H%M%S"))).expanduser().resolve()
+    # Expand both ~ and shell variables like $HOME / ${HOME} in the template.
+    expanded = os.path.expandvars(template.format(repo=name, date=now_utc.strftime("%Y%m%d-%H%M%S")))
+    return Path(expanded).expanduser().resolve()
 
 
 def _render_prompt(repo: Path, tasks: list[Task], allow_file_writes: bool, section_name: str = "") -> str:
@@ -791,45 +844,52 @@ def _create_worktree(repo: Path, section_slug: str, timestamp: str) -> tuple[Pat
 
 
 def _merge_worktree(repo: Path, branch: str, worktree_path: Path, section_name: str) -> tuple[bool, list[str]]:
-    """Merge a section branch back into HEAD. Returns (success, conflicting_files)."""
-    # First check if the branch has any commits ahead of the current HEAD
-    try:
-        diff = subprocess.run(
-            ["git", "rev-list", "--count", f"HEAD..{branch}"],
-            cwd=str(repo),
-            capture_output=True,
-            text=True,
-        )
-        if diff.returncode == 0 and diff.stdout.strip() == "0":
-            # No commits — agent made no changes, nothing to merge
-            _cleanup_worktree(repo, branch, worktree_path)
-            return True, []
-    except OSError:
-        pass
+    """Merge a section branch back into HEAD. Returns (success, conflicting_files).
 
-    try:
-        result = subprocess.run(
-            ["git", "merge", "--no-ff", branch, "-m", f"cc-later: {section_name or 'resume'} tasks"],
-            cwd=str(repo),
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            _cleanup_worktree(repo, branch, worktree_path)
-            return True, []
-        # Merge failed — collect conflicting files
-        conflict_result = subprocess.run(
-            ["git", "diff", "--name-only", "--diff-filter=U"],
-            cwd=str(repo),
-            capture_output=True,
-            text=True,
-        )
-        conflicting = [f.strip() for f in conflict_result.stdout.splitlines() if f.strip()]
-        # Abort the failed merge so the repo is not left in a broken state
-        subprocess.run(["git", "merge", "--abort"], cwd=str(repo), capture_output=True)
-        return False, conflicting
-    except OSError:
-        return False, []
+    Uses an advisory lock to prevent concurrent merges into the same repo
+    (e.g. two section agents finishing simultaneously).
+    """
+    # Scope the lock to this specific repo to avoid cross-repo contention.
+    lock_name = f"merge-{repo.name}"
+    with _flock(lock_name):
+        # First check if the branch has any commits ahead of the current HEAD
+        try:
+            diff = subprocess.run(
+                ["git", "rev-list", "--count", f"HEAD..{branch}"],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+            )
+            if diff.returncode == 0 and diff.stdout.strip() == "0":
+                # No commits — agent made no changes, nothing to merge
+                _cleanup_worktree(repo, branch, worktree_path)
+                return True, []
+        except OSError:
+            pass
+
+        try:
+            result = subprocess.run(
+                ["git", "merge", "--no-ff", branch, "-m", f"cc-later: {section_name or 'resume'} tasks"],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                _cleanup_worktree(repo, branch, worktree_path)
+                return True, []
+            # Merge failed — collect conflicting files
+            conflict_result = subprocess.run(
+                ["git", "diff", "--name-only", "--diff-filter=U"],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+            )
+            conflicting = [f.strip() for f in conflict_result.stdout.splitlines() if f.strip()]
+            # Abort the failed merge so the repo is not left in a broken state
+            subprocess.run(["git", "merge", "--abort"], cwd=str(repo), capture_output=True)
+            return False, conflicting
+        except OSError:
+            return False, []
 
 
 def _cleanup_worktree(repo: Path, branch: str, worktree_path: Path) -> None:
@@ -884,7 +944,7 @@ def _is_agent_stale(agent: dict[str, Any], now_utc: datetime, stale_minutes: int
 
 
 def _kill_agent(pid: int | None) -> None:
-    if pid is None:
+    if pid is None or pid <= 0:
         return
     try:
         os.kill(pid, signal.SIGTERM)

@@ -1058,5 +1058,101 @@ class ReconcileEdgeCaseTests(_Base):
                 self.assertEqual(state.repos[str(repo)].resume_entries[0]["id"], t2.id)
 
 
+class ReconcileInFlightButNoAgents(_Base):
+    """Edge case: in_flight=True but agents=[] (stuck state)."""
+
+    @patch.object(core, "_is_process_alive", return_value=False)
+    def test_in_flight_true_agents_empty_clears_in_flight(self, _):
+        """When in_flight=True but agents=[], reconcile should clear in_flight."""
+        with tempfile.TemporaryDirectory() as app, tempfile.TemporaryDirectory() as repo_dir:
+            app_dir, repo = Path(app), Path(repo_dir)
+            self._setup_repo(repo)
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app_dir)}, clear=False):
+                self._write_config(app_dir, repo)
+                cfg = core.load_config()
+                state = core.State()
+                state.repos[str(repo)] = core.RepoState(in_flight=True, agents=[])
+
+                completed = core._reconcile(cfg, state, datetime.now(timezone.utc))
+                self.assertEqual(completed, 0)
+                self.assertFalse(state.repos[str(repo)].in_flight)
+
+
+class ReconcileCorruptResultFile(_Base):
+    """Edge case: valid file but not valid cc-later output."""
+
+    @patch.object(core, "_is_process_alive", return_value=False)
+    def test_corrupt_result_file_treated_as_all_failed(self, _):
+        """Result file with gibberish content - all entries default to FAILED."""
+        with tempfile.TemporaryDirectory() as app, tempfile.TemporaryDirectory() as repo_dir:
+            app_dir, repo = Path(app), Path(repo_dir)
+            later = self._setup_repo(repo)
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app_dir)}, clear=False):
+                self._write_config(app_dir, repo)
+                cfg = core.load_config()
+                state = core.State()
+                task = core.parse_tasks(later.read_text(encoding="utf-8"))[0].tasks[0]
+                result_file = repo / "result.json"
+                result_file.write_text("This is random garbage, not proper output format\n{\"json\": true}\n", encoding="utf-8")
+                agent = self._make_agent([task], result_path=str(result_file), pid=None)
+                state.repos[str(repo)] = core.RepoState(in_flight=True, agents=[agent])
+
+                core._reconcile(cfg, state, datetime.now(timezone.utc))
+                # Task should NOT be marked done since no DONE marker found
+                updated = later.read_text(encoding="utf-8")
+                self.assertNotIn("[x]", updated)
+
+
+class IsAgentStaleResultPathIsDirectory(_Base):
+    """Edge case: result_path points to a directory, not a file."""
+
+    def test_result_path_is_directory(self):
+        """_is_agent_stale when result_path is a directory should not crash."""
+        with tempfile.TemporaryDirectory() as d:
+            # d itself is a directory
+            agent = {"result_path": d, "dispatch_ts": None}
+            now = datetime.now(timezone.utc)
+            # Should not raise; behavior depends on whether stat works on dirs
+            result = core._is_agent_stale(agent, now, stale_minutes=10)
+            # A directory exists and has mtime, so it should be evaluated
+            self.assertIsInstance(result, bool)
+
+
+class KillAgentPidZero(_Base):
+    """Edge case: _kill_agent with PID 0 (init/kernel process)."""
+
+    @patch("os.kill")
+    def test_pid_zero_is_guarded(self, mock_kill):
+        """_kill_agent with PID 0 — must NOT call os.kill (would kill process group)."""
+        core._kill_agent(0)
+        mock_kill.assert_not_called()
+
+
+class NudgeRedispatchSpawnFailure(_Base):
+    """Edge case: nudge redispatch when _spawn_dispatch returns None."""
+
+    @patch.object(core, "_spawn_dispatch", return_value=None)
+    @patch.object(core, "_is_process_alive", return_value=False)
+    def test_spawn_failure_during_nudge_agent_dropped(self, _, mock_spawn):
+        """When _spawn_dispatch returns None during nudge, agent should not remain in agents."""
+        with tempfile.TemporaryDirectory() as app, tempfile.TemporaryDirectory() as repo_dir:
+            app_dir, repo = Path(app), Path(repo_dir)
+            later = self._setup_repo(repo)
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app_dir)}, clear=False):
+                self._write_config(app_dir, repo, nudge_enabled=True, max_retries=3, allow_file_writes=False)
+                cfg = core.load_config()
+                state = core.State()
+                task = core.parse_tasks(later.read_text(encoding="utf-8"))[0].tasks[0]
+                agent = self._make_agent(
+                    [task], result_path="/tmp/nonexistent_xyz.json", pid=None, retries=0,
+                )
+                state.repos[str(repo)] = core.RepoState(in_flight=True, agents=[agent])
+
+                core._reconcile(cfg, state, datetime.now(timezone.utc))
+                # Spawn returned None, no worktree, agent should not be in remaining
+                self.assertFalse(state.repos[str(repo)].in_flight)
+                self.assertEqual(len(state.repos[str(repo)].agents), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

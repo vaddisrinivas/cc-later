@@ -786,5 +786,116 @@ class RunStatsEdgeCasesTests(unittest.TestCase):
                     self.assertIn("500", output)
 
 
+class ParseTasksEdgeCases(unittest.TestCase):
+    def test_crlf_line_endings(self):
+        """parse_tasks with Windows \\r\\n line endings."""
+        content = "## Queue\r\n- [ ] (P1) task one\r\n- [ ] (P0) task two\r\n"
+        sections = core.parse_tasks(content)
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(len(sections[0].tasks), 2)
+        self.assertEqual(sections[0].tasks[0].text, "task one")
+        self.assertEqual(sections[0].tasks[1].text, "task two")
+
+    def test_task_text_with_markdown(self):
+        """parse_tasks with task text containing markdown links, bold, code."""
+        content = (
+            "- [ ] (P1) fix [this link](https://example.com) in docs\n"
+            "- [ ] (P1) update **bold** text in README\n"
+            "- [ ] (P1) refactor `inline_code` usage\n"
+        )
+        sections = core.parse_tasks(content)
+        self.assertEqual(len(sections[0].tasks), 3)
+        self.assertIn("[this link]", sections[0].tasks[0].text)
+        self.assertIn("**bold**", sections[0].tasks[1].text)
+        self.assertIn("`inline_code`", sections[0].tasks[2].text)
+
+    def test_duplicate_task_ids_same_text_different_lines(self):
+        """parse_tasks with identical task text on different lines — IDs should differ."""
+        content = "- [ ] (P1) fix bug\n- [ ] (P1) fix bug\n"
+        sections = core.parse_tasks(content)
+        self.assertEqual(len(sections[0].tasks), 2)
+        # IDs should be different because line_index differs
+        self.assertNotEqual(sections[0].tasks[0].id, sections[0].tasks[1].id)
+
+
+class StableTaskIdEdgeCases(unittest.TestCase):
+    def test_empty_text(self):
+        """stable_task_id with empty text produces valid ID."""
+        tid = core.stable_task_id(0, "")
+        self.assertTrue(tid.startswith("t_"))
+        self.assertEqual(len(tid), 12)
+
+    def test_very_long_text(self):
+        """stable_task_id with 1000+ char text produces valid fixed-length ID."""
+        long_text = "a" * 1500
+        tid = core.stable_task_id(0, long_text)
+        self.assertTrue(tid.startswith("t_"))
+        self.assertEqual(len(tid), 12)
+        # Should be deterministic
+        self.assertEqual(tid, core.stable_task_id(0, long_text))
+
+
+class MarkDoneInContentEdgeCases(unittest.TestCase):
+    def test_task_id_in_comment_not_checkbox(self):
+        """mark_done_in_content should only mark checkboxes, not comments/headers."""
+        content = (
+            "# Header mentioning fix bug\n"
+            "Some text about fix bug\n"
+            "- [ ] (P1) fix bug\n"
+        )
+        tid = core.stable_task_id(2, "fix bug")
+        result = core.mark_done_in_content(content, {tid})
+        self.assertIn("- [x] (P1) fix bug", result)
+        # Header should be unchanged
+        self.assertIn("# Header mentioning fix bug", result)
+        # Only one [x] should exist
+        self.assertEqual(result.count("[x]"), 1)
+
+
+class DetectLimitExhaustionEdgeCases(unittest.TestCase):
+    def test_partial_match_rate_limiting(self):
+        """detect_limit_exhaustion with 'rate limiting' should match 'rate limit'."""
+        result = core.detect_limit_exhaustion("Error: rate limiting in effect")
+        self.assertIsNotNone(result)
+
+    def test_partial_match_no_match(self):
+        """detect_limit_exhaustion with 'limited' should not match 'rate limit'."""
+        result = core.detect_limit_exhaustion("This is a limited edition")
+        # 'rate limit' is the marker, 'limited' alone should not match
+        self.assertIsNone(result)
+
+
+class RunStatsNoJsonlTests(unittest.TestCase):
+    def test_run_stats_with_no_jsonl_files_at_all(self):
+        """run_stats with empty roots that have no JSONL files."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(core, "resolve_jsonl_roots", return_value=[root]):
+                with patch("builtins.print") as mock_print:
+                    ret = core.run_stats(days=7)
+                    self.assertEqual(ret, 0)
+                    output = mock_print.call_args[0][0]
+                    # Should still produce output without errors
+                    self.assertIn("cc-later Stats", output)
+                    self.assertIn("0", output)
+
+
+class RunCompactInjectEdgeCases(unittest.TestCase):
+    def test_compact_disabled_returns_zero_no_output(self):
+        """run_compact_inject when compact is disabled returns 0, no print."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "app"
+            app.mkdir()
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            (repo / ".git").mkdir()
+            (app / "config.env").write_text("COMPACT_ENABLED=false\n", encoding="utf-8")
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app)}, clear=False):
+                with patch("builtins.print") as mock_print:
+                    result = core.run_compact_inject(cwd_hint=str(repo))
+                    self.assertEqual(result, 0)
+                    mock_print.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

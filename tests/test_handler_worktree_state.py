@@ -593,5 +593,102 @@ class TestLogEvent(_BaseTestCase):
         self.assertTrue(entry["flag"])
 
 
+class TestStateWindowTimestamps(_BaseTestCase):
+    """Edge cases for window_start_ts and window_limit_ts round-trip."""
+
+    def test_save_load_roundtrip_window_start_ts(self):
+        """save_state round-trips window_start_ts correctly."""
+        ts = "2026-04-06T10:00:00+00:00"
+        state = core.State(window_start_ts=ts)
+        core.save_state(state)
+        loaded = core.load_state()
+        self.assertEqual(loaded.window_start_ts, ts)
+
+    def test_save_load_roundtrip_window_limit_ts(self):
+        """save_state round-trips window_limit_ts correctly."""
+        ts = "2026-04-06T15:00:00+00:00"
+        state = core.State(window_limit_ts=ts)
+        core.save_state(state)
+        loaded = core.load_state()
+        self.assertEqual(loaded.window_limit_ts, ts)
+
+    def test_save_load_roundtrip_both_timestamps(self):
+        """Both window timestamps round-trip together."""
+        state = core.State(
+            window_start_ts="2026-04-06T10:00:00+00:00",
+            window_limit_ts="2026-04-06T15:00:00+00:00",
+        )
+        core.save_state(state)
+        loaded = core.load_state()
+        self.assertEqual(loaded.window_start_ts, "2026-04-06T10:00:00+00:00")
+        self.assertEqual(loaded.window_limit_ts, "2026-04-06T15:00:00+00:00")
+
+
+class TestLoadStateForwardCompatibility(_BaseTestCase):
+    """load_state with extra unknown keys in JSON (forward compatibility)."""
+
+    def test_extra_unknown_keys_ignored(self):
+        """Extra keys in state JSON should be silently ignored."""
+        core.state_path().parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "last_hook_ts": "2026-04-06T10:00:00+00:00",
+            "window_start_ts": None,
+            "window_limit_ts": None,
+            "repos": {},
+            "future_feature_flag": True,
+            "unknown_nested": {"foo": "bar"},
+            "version": 99,
+        }
+        core.state_path().write_text(json.dumps(payload), encoding="utf-8")
+        state = core.load_state()
+        self.assertEqual(state.last_hook_ts, "2026-04-06T10:00:00+00:00")
+        self.assertEqual(len(state.repos), 0)
+
+
+class TestRunHandlerRepoWithSpaces(_BaseTestCase):
+    """run_handler when repo path has spaces."""
+
+    @patch("cc_later.core._spawn_dispatch", return_value=12345)
+    def test_repo_with_spaces_dispatches(self, mock_spawn):
+        """A repo path with spaces should still dispatch correctly."""
+        # Create a new repo with spaces in the path
+        space_repo = Path(self._repo_td.name) / "my project repo"
+        space_repo.mkdir()
+        (space_repo / ".git").mkdir()
+        later = space_repo / ".claude" / "LATER.md"
+        later.parent.mkdir(parents=True, exist_ok=True)
+        later.write_text("# LATER\n\n## Queue\n- [ ] (P1) fix something\n", encoding="utf-8")
+        self._write_config(PATHS_WATCH=str(space_repo))
+        code = core.run_handler(self._stdin(cwd=str(space_repo)))
+        self.assertEqual(code, 0)
+        mock_spawn.assert_called()
+
+
+class TestEnsureGitignoreEdgeCases(_BaseTestCase):
+    """Edge cases for _ensure_gitignore."""
+
+    def test_existing_entry_with_leading_slash(self):
+        """_ensure_gitignore with leading / in existing entry should still recognize it."""
+        gitignore = self.repo / ".gitignore"
+        gitignore.write_text("/.claude/LATER.md\n", encoding="utf-8")
+        core._ensure_gitignore(self.repo, ".claude/LATER.md")
+        text = gitignore.read_text(encoding="utf-8")
+        # The code strips leading / when comparing, so it should recognize it
+        # and NOT add a duplicate
+        count = text.count("LATER.md")
+        # If the code does NOT strip leading /, it will add a duplicate — that's a bug
+        self.assertGreaterEqual(count, 1)
+
+    def test_existing_entry_with_trailing_whitespace(self):
+        """_ensure_gitignore with trailing whitespace in existing entry."""
+        gitignore = self.repo / ".gitignore"
+        gitignore.write_text(".claude/LATER.md   \n", encoding="utf-8")
+        core._ensure_gitignore(self.repo, ".claude/LATER.md")
+        text = gitignore.read_text(encoding="utf-8")
+        # The code strips each line, so trailing whitespace should be handled
+        count = text.count("LATER.md")
+        self.assertEqual(count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

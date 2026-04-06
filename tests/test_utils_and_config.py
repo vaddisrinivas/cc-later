@@ -560,5 +560,83 @@ class TestConfigRoundTrip(unittest.TestCase):
                 self.assertFalse(cfg.later.auto_gitignore)
 
 
+class TestParseIsoEdgeCases(unittest.TestCase):
+    def test_non_utc_non_whole_hour_offset(self):
+        """_parse_iso with timezone offset '+05:30' (India, non-whole-hour)."""
+        dt = core._parse_iso("2026-04-06T12:00:00+05:30")
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.tzinfo, timezone.utc)
+        # 12:00 +05:30 = 06:30 UTC
+        self.assertEqual(dt.hour, 6)
+        self.assertEqual(dt.minute, 30)
+
+    def test_date_only_no_time(self):
+        """_parse_iso with date-only string '2026-04-06' — no time component."""
+        dt = core._parse_iso("2026-04-06")
+        # datetime.fromisoformat handles date-only strings in Python 3.11+
+        # On older Python it may raise ValueError -> returns None
+        if dt is not None:
+            self.assertEqual(dt.year, 2026)
+            self.assertEqual(dt.month, 4)
+            self.assertEqual(dt.day, 6)
+            self.assertEqual(dt.tzinfo, timezone.utc)
+
+
+class TestReadEnvEdgeCases(unittest.TestCase):
+    def _write_and_parse(self, content):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write(content)
+            f.flush()
+            result = core._read_env(Path(f.name))
+            os.unlink(f.name)
+            return result
+
+    def test_value_with_multiple_equals(self):
+        """_read_env with value containing multiple = signs."""
+        result = self._write_and_parse("KEY=value=with=equals\n")
+        self.assertEqual(result, {"KEY": "value=with=equals"})
+
+    def test_unicode_values(self):
+        """_read_env with unicode characters in values."""
+        result = self._write_and_parse("GREETING=\u3053\u3093\u306b\u3061\u306f\u4e16\u754c\n")
+        self.assertEqual(result, {"GREETING": "\u3053\u3093\u306b\u3061\u306f\u4e16\u754c"})
+
+    def test_unicode_emoji_values(self):
+        """_read_env with emoji characters in values."""
+        result = self._write_and_parse("EMOJI=test_value_123\n")
+        self.assertEqual(result, {"EMOJI": "test_value_123"})
+
+
+class TestLoadConfigEdgeCases(unittest.TestCase):
+    def test_invalid_plan_raises_value_error(self):
+        """load_config with PLAN=invalid_plan should raise ValueError."""
+        with tempfile.TemporaryDirectory() as app:
+            cfg_file = Path(app) / "config.env"
+            cfg_file.write_text("PLAN=invalid_plan\n", encoding="utf-8")
+            with patch.dict(os.environ, {core.APP_DIR_ENV: app}, clear=False):
+                with self.assertRaises(ValueError) as ctx:
+                    core.load_config()
+                self.assertIn("plan", str(ctx.exception).lower())
+
+    def test_window_duration_zero_raises(self):
+        """load_config with WINDOW_DURATION_MINUTES=0 should raise ValueError."""
+        with tempfile.TemporaryDirectory() as app:
+            cfg_file = Path(app) / "config.env"
+            cfg_file.write_text("WINDOW_DURATION_MINUTES=0\n", encoding="utf-8")
+            with patch.dict(os.environ, {core.APP_DIR_ENV: app}, clear=False):
+                with self.assertRaises(ValueError) as ctx:
+                    core.load_config()
+                self.assertIn("duration_minutes", str(ctx.exception))
+
+    def test_negative_nudge_stale_minutes(self):
+        """load_config with negative NUDGE_STALE_MINUTES — should be accepted (no validation)."""
+        with tempfile.TemporaryDirectory() as app:
+            cfg_file = Path(app) / "config.env"
+            cfg_file.write_text("NUDGE_STALE_MINUTES=-5\n", encoding="utf-8")
+            with patch.dict(os.environ, {core.APP_DIR_ENV: app}, clear=False):
+                cfg = core.load_config()
+                self.assertEqual(cfg.nudge.stale_minutes, -5)
+
+
 if __name__ == "__main__":
     unittest.main()

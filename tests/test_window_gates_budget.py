@@ -689,5 +689,96 @@ class TestInTimeWindows(unittest.TestCase):
         self.assertFalse(_in_time_windows(dt, ["09:00-09:00"]))
 
 
+class TestComputeWindowStateEdgeCases(unittest.TestCase):
+    """Edge cases for compute_window_state."""
+
+    def _write_jsonl(self, path: Path, rows: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    def test_window_start_hint_in_future(self):
+        """compute_window_state with window_start_hint in the future.
+
+        When the hint is in the future, filtering rows by ts >= future_hint yields
+        no rows, so the code falls back to gap-based session detection.
+        """
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        future_hint = datetime(2026, 4, 5, 17, 0, tzinfo=timezone.utc)  # 1h in future
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "s.jsonl"
+            self._write_jsonl(f, [
+                {"timestamp": "2026-04-05T15:50:00Z", "usage": {"input_tokens": 10, "output_tokens": 5}},
+            ])
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            ws = compute_window_state([root], now_utc=now, window_start_hint=future_hint)
+        self.assertIsNotNone(ws)
+        # Future hint causes no rows to pass ts >= earliest filter,
+        # fallback uses gap-based: session_start = 15:50, elapsed = 10min
+        self.assertEqual(ws.elapsed_minutes, 10)
+        self.assertEqual(ws.remaining_minutes, 290)
+
+    def test_window_start_hint_older_than_cutoff(self):
+        """compute_window_state with window_start_hint older than max_start (clamped)."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        old_hint = datetime(2026, 4, 5, 8, 0, tzinfo=timezone.utc)  # 8h ago
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "s.jsonl"
+            self._write_jsonl(f, [
+                {"timestamp": "2026-04-05T15:50:00Z", "usage": {"input_tokens": 10, "output_tokens": 5}},
+            ])
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            ws = compute_window_state([root], now_utc=now, window_start_hint=old_hint)
+        self.assertIsNotNone(ws)
+        # Old hint is before max_start (11:00 UTC), so gap detection is used instead
+        # Gap detection: single row at 15:50, so session_start = 15:50
+        # elapsed = 16:00 - 15:50 = 10 min
+        self.assertEqual(ws.elapsed_minutes, 10)
+        self.assertEqual(ws.remaining_minutes, 290)
+
+    def test_window_duration_zero(self):
+        """compute_window_state with window_duration=0."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "s.jsonl"
+            self._write_jsonl(f, [
+                {"timestamp": "2026-04-05T15:50:00Z", "usage": {"input_tokens": 10, "output_tokens": 5}},
+            ])
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            ws = compute_window_state([root], now_utc=now, window_duration=0)
+        self.assertIsNotNone(ws)
+        # With duration=0, max_start = now, so earliest = max(gap_start, now)
+        # elapsed = now - now = 0, remaining = max(0, 0 - 0) = 0
+        self.assertEqual(ws.remaining_minutes, 0)
+
+
+class TestComputeBudgetStateEdgeCases(unittest.TestCase):
+    """Edge cases for compute_budget_state."""
+
+    def _write_jsonl(self, path: Path, rows: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    def test_non_dict_message_field(self):
+        """compute_budget_state with row['message'] being a non-dict (string)."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "s.jsonl"
+            self._write_jsonl(f, [
+                {
+                    "timestamp": "2026-04-05T15:00:00Z",
+                    "message": "just a string, not a dict",
+                    "usage": {"input_tokens": 100, "output_tokens": 50},
+                },
+            ])
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            bs = compute_budget_state([root], now, weekly_budget=1000)
+        # message is not a dict, so it should fall back to row['usage']
+        self.assertEqual(bs.used_tokens, 150)
+
+
 if __name__ == "__main__":
     unittest.main()
