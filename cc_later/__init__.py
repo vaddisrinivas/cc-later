@@ -1,3 +1,3 @@
-"""cc-later — spot-instance scheduler for Claude Code LATER.md tasks."""
+"""cc-later core package."""
 
-__version__ = "0.3.0"
+from .core import *  # noqa: F401,F403

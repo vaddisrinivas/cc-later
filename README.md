@@ -1,240 +1,409 @@
 # cc-later
 
-**Your Claude Code sessions have a 5-hour window. Use every minute of it.**
+A Claude Code plugin that automatically dispatches follow-up tasks as background agents near the end of each Claude usage window.
 
-cc-later is a Claude Code plugin that dispatches `.claude/LATER.md` tasks as background `claude -p` jobs during idle session time. Zero extra tokens — it spends capacity that would otherwise expire.
+During a session, tasks accumulate in `.claude/LATER.md`. When a usage window is about to expire, cc-later spawns one parallel `claude -p` agent per `##` section in that file — each in its own git worktree and branch to prevent conflicts. When agents finish, their branches are merged back. If an agent hits a rate or usage limit, its unfinished tasks are queued and replayed automatically in the next fresh window.
 
-```
-You end a session with 30 min left on the clock
-    --> cc-later picks up your queued maintenance tasks
-    --> Runs them as headless background agents
-    --> Marks them done, retries failures, generates reports
-    --> Next session: your queue is lighter
-```
+No external Python dependencies. Runs entirely on the standard library.
+
+---
+
+## Table of Contents
+
+- [How it works](#how-it-works)
+- [Install](#install)
+- [LATER.md format](#latermd-format)
+- [Capture shortcut](#capture-shortcut)
+- [Dispatch modes](#dispatch-modes)
+- [Parallel agents and worktrees](#parallel-agents-and-worktrees)
+- [Auto-resume](#auto-resume)
+- [Configuration reference](#configuration-reference)
+- [Status command](#status-command)
+- [File layout](#file-layout)
+- [Development and testing](#development-and-testing)
+
+---
+
+## How it works
+
+1. You (or Claude) write tasks into `.claude/LATER.md`, grouped under `##` section headers.
+2. Every time a Claude session ends, the `Stop` hook fires `scripts/handler.py`.
+3. The handler checks a gate sequence (enabled, idle grace, budget, dispatch mode). If all pass, it spawns one background `claude -p` subprocess per section — all in parallel. When file writes are enabled, each agent runs in its own isolated git worktree on a dedicated branch.
+4. Each agent works through its tasks and writes a structured result file.
+5. On the next hook invocation, completed tasks are marked `[x]` in LATER.md, worktrees are merged back into the main branch and cleaned up, and any limit-failed tasks are re-queued for the next window.
+
+---
 
 ## Install
 
 ```bash
-/plugin marketplace add vaddisrinivas/cc-later
-/plugin install cc-later@cc-later
+claude plugin marketplace add vaddisrinivas/cc-later
+claude plugin install cc-later
 ```
 
-Then enable:
+On first run, `~/.cc-later/config.env` is created from the bundled template. Edit it to configure cc-later for your workflow.
 
-```bash
-# Initialize your repo
-python3 ~/.claude/plugins/cache/cc-later/cc-later/0.3.0/cc_later/cli.py init
+---
 
-# Edit config
-vi ~/.cc-later/config.toml
+## LATER.md format
+
+LATER.md lives at `.claude/LATER.md` in your repo root (configurable). It is a plain Markdown file:
+
+```markdown
+# LATER
+
+## Auth
+- [ ] (P1) fix token refresh in src/auth/service.py
+- [ ] (P0) handle expired sessions in middleware
+
+## Payments
+- [ ] (P1) add retry logic to webhook handler
+- [ ] (P2) clean up stripe client initialization
+
+- [x] (P1) migrate database schema    ← completed, marked by cc-later
 ```
 
-```toml
-[paths]
-watch = ["~/projects/my-repo"]
+### Section headers (`##`)
 
-[dispatch]
-enabled = true
-```
+Each `##` heading defines a group of related tasks. When dispatch fires, **one background agent is spawned per section, all running in parallel**. The Auth agent and Payments agent above start simultaneously, each in its own git worktree and branch, so they cannot conflict.
 
-## Quick Start
+Tasks that appear before the first `##` header are collected into a single unnamed agent.
 
-**1. Queue tasks** during any Claude session:
+### Task syntax
 
 ```
-later: fix the N+1 query in ReportGenerator
-later[!]: SQL injection risk in filter builder
-add to later: update README install steps
+- [ ] (P0) <description>    ← urgent: dispatched first within the section
+- [ ] (P1) <description>    ← normal priority (default)
+- [ ] (P2) <description>    ← nice-to-have
+- [!] <description>         ← shorthand for P0
+- [x] <description>         ← completed (written by cc-later, not by you)
 ```
 
-**2. Tasks dispatch automatically** when your session window is near expiry.
+Priority controls ordering within a section. P0 before P1, P1 before P2. Within the same priority, tasks run in file order. `LATER_MAX_ENTRIES_PER_DISPATCH` caps how many tasks from each section are selected per cycle.
 
-**3. Check status** any time:
-
-```
-/cc-later:status
-```
-
-**4. View analytics:**
-
-```
-/cc-later:stats
-```
-
-## What's New in v0.3.0
-
-| Feature | What it does |
-|---------|-------------|
-| **Modular architecture** | Clean package structure (`cc_later/`) — config, parser, dispatcher, analytics, verify as separate modules |
-| **Smart retry** | Failed tasks retry with exponential backoff (30m, 2h, 8h). After 3 attempts → `[?]` needs human |
-| **Adaptive model routing** | `model_routing = "auto"` routes simple tasks to haiku, complex ones to opus |
-| **Completion verification** | Scores result quality before marking DONE. Weak results get flagged |
-| **SQLite analytics** | Track success rates, token usage, model efficiency. View with `/cc-later:stats` |
-| **Rich reports** | Each dispatch generates `.claude/reports/later-{date}.md` with full results |
-| **Task dependencies** | Chain tasks: `- [ ] Fix X (after: t_abc123)` — won't run until dependency is done |
-| **Webhook notifications** | POST JSON to Slack/Discord on dispatch, complete, error events |
-| **CLI tool** | `cc-later status`, `stats`, `inspect`, `dispatch`, `init`, `queue`, `dry-run` |
-| **Auto-section routing** | Captured tasks auto-sorted into Security/Bugs/Tests/Docs/Refactor/Reports sections |
-
-## LATER.md Format
+### Full annotated example
 
 ```markdown
 # LATER
 
 ## Security
-- [!] Fix SQL injection in ReportFilter.build_query() (src/reports/filter.py)
+- [ ] (P0) SQL injection in report filter — src/reports/filter.py:42
+- [ ] (P1) Add CSRF token validation to /api/upload endpoint
 
-## Tests
-- [ ] Add integration tests for auth flow (tests/test_auth.py)
-  <!-- cc-later: attempts=1, last=2026-04-01T12:00:00Z -->
-- [ ] Add edge case tests for pagination (after: t_abc123)
+## Performance
+- [ ] (P1) Replace N+1 query in ReportGenerator.fetch_reports (src/reports/service.py)
+- [ ] (P2) Cache user profile lookups in src/users/views.py
 
 ## Docs
-- [ ] Update README to match current CLI flags
-- [?] Document the new webhook config — needs human decision on format
+- [ ] (P2) Update CLI flags in README to match src/cli.py argument parser
+- [x] (P1) Fix broken link in CONTRIBUTING.md
 ```
 
-| Marker | Meaning |
-|--------|---------|
-| `- [ ]` | Pending — will be dispatched |
-| `- [!]` | Priority — dispatched first, routed to stronger model |
-| `- [x]` | Completed — marked by handler |
-| `- [?]` | Needs human — failed after max retries |
+Two agents run in parallel: one for Security, one for Performance (and one for Docs if tasks remain). Each works on a separate branch and cannot overwrite the other's changes.
 
-## Key Phrase Capture
+---
 
-Type these during a session to auto-queue:
+## Capture shortcut
 
-| Phrase | Example |
-|--------|---------|
-| `later:` | `later: fix the N+1 query in reports` |
-| `later[!]:` | `later[!]: SQL injection in filter builder` |
-| `add to later:` | `add to later: update README install steps` |
-| `note for later:` | `note for later: UserService.delete() swallows exceptions` |
-| `queue for later:` | `queue for later: add rate limiting to /refresh` |
-| `for later:` | `for later: check the migration script` |
+Add tasks to LATER.md directly from your prompt. The `UserPromptSubmit` hook watches for these patterns:
 
-Tasks are auto-sorted into the matching section (Security, Bugs, Tests, etc.).
+| Prompt pattern | Result |
+|---|---|
+| `later: fix the auth bug` | Appends as `(P1)` task |
+| `add to later: update readme` | Appends as `(P1)` task |
+| `note for later: clean up tests` | Appends as `(P1)` task |
+| `queue for later: refactor parser` | Appends as `(P1)` task |
+| `for later: add pagination` | Appends as `(P1)` task |
+| `later[!]: SQL injection in filter` | Appends as `(P0)` urgent task |
 
-## Dispatch Modes
+Multiple captures in one prompt are all appended. Duplicates (case-insensitive substring match) are suppressed.
 
-| Mode | Behavior |
-|------|----------|
-| `window_aware` (default) | Dispatches when <=30 min remain in 5-hr session |
-| `time_based` | Dispatches during configured hours (e.g. `["22:00-02:00"]`) |
-| `always` | Dispatches whenever idle gate is open |
+Example:
 
-## Model Routing
-
-Set `model_routing = "auto"` to route tasks by complexity:
-
-| Complexity | Model | Examples |
-|-----------|-------|---------|
-| 1-2 (simple) | haiku | `Check import`, `Remove dead code` |
-| 3 (medium) | sonnet | `Fix bug in auth.py`, `Add type hints` |
-| 4-5 (complex) | opus | `Audit auth flow`, `Refactor + multi-file` |
-
-Complexity is scored by: verb weight, file count, section (Security/Bugs = higher), description length, priority flag.
-
-## Configuration
-
-All settings in `~/.cc-later/config.toml`:
-
-```toml
-[dispatch]
-enabled = true
-model = "sonnet"               # default model
-model_routing = "fixed"        # "fixed" | "auto"
-allow_file_writes = false      # read-only by default
-
-[retry]
-enabled = true
-max_attempts = 3
-backoff_minutes = [30, 120, 480]
-escalate_to_priority = true    # mark [?] after max attempts
-
-[verify]
-enabled = true
-min_confidence = "low"         # "low" | "medium" | "high"
-
-[notifications]
-desktop = false
-webhook_url = ""               # Slack/Discord incoming webhook
-webhook_events = ["dispatch", "complete", "error"]
-
-[budget]
-weekly_token_budget = 10_000_000
-backoff_at_pct = 80            # stop at 80% of weekly budget
+```
+That looks good. later: add integration test for the retry path
+later[!]: fix the exposed debug endpoint before deploying
 ```
 
-Full config reference: `scripts/default_config.toml`
+Capture tasks are appended without a section header. To place them in a specific section, write LATER.md directly.
 
-## CLI
+---
+
+## Dispatch modes
+
+`WINDOW_DISPATCH_MODE` controls when the dispatch gate opens.
+
+| Mode | Behavior | Best for |
+|---|---|---|
+| `window_aware` | Fires when the current 5-hour Claude usage window has ≤ `WINDOW_TRIGGER_AT_MINUTES_REMAINING` minutes remaining. Requires active JSONL session data. | Most users — tasks run near window end, using otherwise-idle capacity |
+| `time_based` | Fires only inside the time ranges in `WINDOW_FALLBACK_DISPATCH_HOURS` (local time). No window data required. | Teams with predictable off-hours or deterministic scheduling |
+| `always` | Fires whenever the idle grace period passes. | Development, testing, or continuous dispatch |
+
+### Gate sequence
+
+All gates fire in order. The first failure skips the cycle.
+
+1. **`DISPATCH_ENABLED`** — master on/off switch
+2. **Idle grace** — at least `WINDOW_IDLE_GRACE_PERIOD_MINUTES` since the last hook run (prevents thrashing)
+3. **Weekly budget** — stop if `LIMITS_BACKOFF_AT_PCT`% of `LIMITS_WEEKLY_BUDGET_TOKENS` is consumed
+4. **Mode gate** — fires as described above
+
+The auto-resume gate is evaluated separately and can trigger even when the mode gate is closed.
+
+---
+
+## Parallel agents and worktrees
+
+When `DISPATCH_ALLOW_FILE_WRITES=true`, cc-later creates an isolated git worktree for each section agent before spawning it. This prevents agents from conflicting on the same files.
+
+### Worktree lifecycle
+
+```
+dispatch:
+  timestamp = YYYYMMDD-HHMMSS (same for all sections in one cycle)
+  for each section:
+    git worktree add ~/.cc-later/worktrees/{repo}-{slug}-{ts}
+                     -b cc-later/{slug}-{ts}
+    spawn agent with cwd = worktree path
+
+reconcile (agent finishes):
+  if branch has no new commits → skip merge, clean up
+  git -C {repo} merge --no-ff cc-later/{slug}-{ts}
+                       -m "cc-later: {section} tasks"
+  if merge OK  → git worktree remove + git branch -d
+  if conflict  → git merge --abort
+                 preserve worktree, mark tasks NEEDS_HUMAN
+                 log merge_conflict event with conflicting files
+```
+
+Each agent commits its changes to its own branch. On reconcile, branches are merged back one at a time in completion order. If two sections edited the same file and the second merge conflicts, the merge is aborted (repo left clean), the worktree is preserved for manual resolution, and the affected tasks are marked `NEEDS_HUMAN`.
+
+When `DISPATCH_ALLOW_FILE_WRITES=false` (default), no worktrees are created — agents run in the repo directory and are instructed not to modify files.
+
+### Branch naming
+
+`cc-later/{section-slug}-{YYYYMMDD-HHMMSS}`
+
+Section names are slugified: non-alphanumeric characters replaced with `_`. All sections in a single dispatch cycle share the same timestamp suffix.
+
+| Section name | Branch |
+|---|---|
+| `Auth` | `cc-later/Auth-20260406-100000` |
+| `Auth & Tokens` | `cc-later/Auth___Tokens-20260406-100000` |
+| _(no header)_ | `cc-later/default-20260406-100000` |
+| resume | `cc-later/resume-20260406-100000` |
+
+### Merge conflicts
+
+If a merge conflict occurs during reconcile:
+- The failed merge is aborted immediately — the repo is left in a clean state
+- The worktree is **preserved** at `~/.cc-later/worktrees/` for inspection
+- All tasks from that agent are marked `NEEDS_HUMAN`
+- A `merge_conflict` event is logged with branch name and conflicting file list
+- cc-later prints the worktree path to stdout
+
+To resolve manually:
 
 ```bash
-cc-later status       # Window, gates, queue, recent runs, analytics summary
-cc-later stats        # Full analytics dashboard
-cc-later inspect      # Inspect recent dispatch results
-cc-later dry-run      # See what would dispatch
-cc-later init [path]  # Initialize a repo
-cc-later queue [path] # Show pending queue with complexity scores
-cc-later dispatch     # Force a dispatch cycle
-cc-later import-log   # Backfill analytics from run_log.jsonl
+# Inspect what the agent changed
+cd ~/.cc-later/worktrees/{repo}-{slug}-{ts}
+git diff HEAD~1
+
+# Manually merge into your repo
+cd /path/to/repo
+git merge --no-ff cc-later/{slug}-{ts}
+# resolve conflicts, then commit
+
+# Clean up
+git worktree remove ~/.cc-later/worktrees/{repo}-{slug}-{ts}
+git branch -d cc-later/{slug}-{ts}
 ```
 
-## Architecture
+---
 
-```
-cc_later/               # Core package
-  models.py             # All dataclasses (config, state, entries)
-  config.py             # Config loading + validation
-  parser.py             # LATER.md parsing, completion, retry, rotation
-  dispatcher.py         # Main handler loop + reconciliation
-  window.py             # Window state, budget, time utilities
-  analytics.py          # SQLite analytics engine
-  verify.py             # Completion verification pipeline
-  reporter.py           # Rich report generation
-  prompt.py             # Dispatch prompt rendering
-  notify.py             # Desktop + webhook notifications
-  lock.py               # Non-blocking file lock
-  cli.py                # CLI entry point
-  compat.py             # Python 3.9+ compatibility
+## Auto-resume
 
-scripts/                # Hook entry points (thin shims)
-  handler.py            # Stop hook → cc_later.dispatcher
-  capture.py            # UserPromptSubmit hook
-  status.py             # /cc-later:status command
-  probe.py              # Cron-based window probe
+When a background agent's output contains rate or usage limit signals (`"rate limit"`, `"usage limit"`, `"quota"`, `"429"`, `"5-hour window"`, `"window exhausted"`, `"try again later"`), its failed tasks are saved to `resume_entries` in state.json.
 
-tests/                  # 150 tests across 19 modules
-```
+On the next handler run, if `AUTO_RESUME_ENABLED=true` and (in `window_aware` mode) at least `AUTO_RESUME_MIN_REMAINING_MINUTES` remain, those tasks are re-dispatched as a single agent.
 
-## Troubleshooting
+Resume dispatch happens before normal section dispatch. The auto-resume agent runs in its own worktree if file writes are enabled.
 
-**Tasks never dispatch** — run `cc-later dry-run` to see which gate is blocking.
+---
 
-**Capture doesn't fire** — verify the phrase includes a colon (`later: fix this`, not `fix this later`).
+## Configuration reference
 
-**Results not marking LATER.md** — check `~/.cc-later/results/` for output files and `~/.cc-later/run_log.jsonl` for events.
+Config lives at `~/.cc-later/config.env` as plain `KEY=VALUE`. Comment lines start with `#`. Created automatically on first run.
 
-**Verification too strict** — lower `verify.min_confidence` to `"low"` or disable with `verify.enabled = false`.
+### Paths
 
-**Retries not working** — check retry metadata comments in LATER.md. Tasks at max attempts show `[?]`.
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `PATHS_WATCH` | comma-separated paths | _(empty)_ | Repos to watch. Empty = auto-detect from hook cwd. |
 
-## Development
+### LATER.md
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `LATER_PATH` | string | `.claude/LATER.md` | Path to LATER.md relative to repo root. |
+| `LATER_MAX_ENTRIES_PER_DISPATCH` | integer | `3` | Max tasks selected per section per dispatch cycle. |
+| `LATER_AUTO_GITIGNORE` | bool | `true` | Auto-add `LATER_PATH` to `.gitignore`. |
+
+### Dispatch
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `DISPATCH_ENABLED` | bool | `true` | Master on/off switch. |
+| `DISPATCH_MODEL` | string | `sonnet` | Model for background agents. One of: `sonnet`, `opus`, `haiku`. |
+| `DISPATCH_ALLOW_FILE_WRITES` | bool | `false` | When `true`, agents may edit files directly (each in its own git worktree). When `false`, agents report findings only. |
+| `DISPATCH_OUTPUT_PATH` | string | `~/.cc-later/results/{repo}-{date}.json` | Path template for agent result files. `{repo}` includes section slug when applicable. |
+
+### Window
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `WINDOW_DISPATCH_MODE` | string | `window_aware` | One of: `window_aware`, `time_based`, `always`. |
+| `WINDOW_TRIGGER_AT_MINUTES_REMAINING` | integer | `30` | (`window_aware`) Dispatch when ≤ this many minutes remain. |
+| `WINDOW_IDLE_GRACE_PERIOD_MINUTES` | integer | `10` | Minimum minutes between dispatch attempts. |
+| `WINDOW_FALLBACK_DISPATCH_HOURS` | comma-separated ranges | _(empty)_ | (`time_based`) Local-time ranges as `HH:MM-HH:MM`. Overnight ranges supported. Example: `22:00-06:00`. |
+| `WINDOW_JSONL_PATHS` | comma-separated paths | _(empty)_ | Override JSONL paths for window/budget detection. |
+
+### Limits
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `LIMITS_WEEKLY_BUDGET_TOKENS` | integer | `10000000` | Rolling 7-day token budget across all repos. |
+| `LIMITS_BACKOFF_AT_PCT` | integer | `80` | Pause dispatch at this % of weekly budget consumed. |
+
+### Auto-resume
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `AUTO_RESUME_ENABLED` | bool | `true` | Re-dispatch limit-failed tasks in the next fresh window. |
+| `AUTO_RESUME_MIN_REMAINING_MINUTES` | integer | `240` | (`window_aware`) Only auto-resume when ≥ this many minutes remain. |
+
+---
+
+## Status command
 
 ```bash
-# Run all tests (150 tests)
-python3 -m unittest discover -s tests -v
+/cc-later:status
+```
 
-# Dry-run gate check
-python3 scripts/handler.py --dry-run
+Example output:
 
-# Status dashboard
+```
+## cc-later Status
+
+### Window
+  Mode: window_aware
+  Elapsed/Remaining: 142m / 158m
+  Tokens: 84,201 in / 12,450 out
+  Window ends: 2026-04-06 14:22 PDT
+  Next window: starts on first Claude request after 14:22 PDT
+  Weekly budget: 1,240,000 / 10,000,000 (12.4%)
+  Backoff at: 80% (8,000,000 tokens)
+
+### Queue
+  myrepo/ [in-flight]
+    pending: 4
+    agent [Auth]: pid=84312  branch=cc-later/Auth-20260406-100000
+    agent [Payments]: pid=84313  branch=cc-later/Payments-20260406-100000
+
+### Gates
+  dispatch.enabled: pass
+  mode gate: FAIL
+  auto-resume gate: closed
+  budget gate: pass
+
+### Recent Runs
+  04-06 10:18 dispatch
+  04-06 09:55 skip             idle_grace_active
+  04-06 09:32 dispatch
+  04-05 23:41 skip             mode_gate_closed
+```
+
+---
+
+## File layout
+
+```
+~/.cc-later/
+  config.env                              ← your configuration
+  state.json                              ← in-flight agent and resume queue tracking
+  run_log.jsonl                           ← append-only event log
+  results/
+    myrepo-Auth-20260406-100000.json      ← per-agent structured output
+    myrepo-Payments-20260406-100000.json
+  worktrees/                              ← only when DISPATCH_ALLOW_FILE_WRITES=true
+    myrepo-Auth-20260406-100000/          ← isolated worktree, removed on clean merge
+    myrepo-Payments-20260406-100000/      ← preserved on conflict for manual resolution
+
+<repo-root>/
+  .claude/
+    LATER.md                    ← task queue (auto-added to .gitignore)
+```
+
+Plugin source:
+
+```
+cc_later/
+  __init__.py
+  core.py                       ← all logic: config, state, parsing, dispatch, worktrees, status, capture
+
+scripts/
+  handler.py                    ← Stop hook → core.run_handler()
+  capture.py                    ← UserPromptSubmit hook → core.capture_from_payload()
+  status.py                     ← /cc-later:status → core.run_status()
+  default_config.env            ← config template (copied on first run)
+
+hooks/hooks.json
+commands/status.md
+skills/later/SKILL.md
+.claude-plugin/plugin.json
+.claude-plugin/marketplace.json
+```
+
+---
+
+## Development and testing
+
+No external packages required.
+
+```bash
+# Run all tests
+python3 -m pytest tests/ -v
+
+# Smoke-test the handler without spawning real agents
+echo '{}' | python3 scripts/handler.py
+
+# Check status
 python3 scripts/status.py
+```
 
-# CLI
-python3 cc_later/cli.py status
-python3 cc_later/cli.py stats
-python3 cc_later/cli.py inspect
+Test files:
+
+| File | What it tests |
+|---|---|
+| `test_config_and_format.py` | Config loading, task/section parsing, priority ordering, mark-done |
+| `test_handler_status_capture.py` | Full capture → dispatch → reconcile → status flow |
+| `test_reconcile_resume.py` | Limit-fail detection, resume scheduling, done-marking |
+| `test_window_budget.py` | JSONL window calculation, stale row filtering, weekly budget |
+| `test_plugin_layout.py` | Plugin manifest validity, hook config, command presence |
+
+To test dispatch without spawning real agents:
+
+```python
+from unittest.mock import patch
+with patch("cc_later.core._spawn_dispatch", return_value=12345):
+    core.run_handler(json.dumps({"cwd": str(repo)}))
+```
+
+To isolate tests from `~/.cc-later`:
+
+```python
+import os
+from unittest.mock import patch
+with patch.dict(os.environ, {"CC_LATER_APP_DIR": "/tmp/test-cc-later"}):
+    cfg = core.load_config()
 ```

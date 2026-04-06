@@ -1,5 +1,9 @@
 {
   "name": "cc-later",
-  "version": "0.3.0",
-  "description": "Smart background task engine: dispatches LATER.md tasks during idle window capacity with retry intelligence, analytics, verification, and adaptive model routing."
+  "version": "4.0.0",
+  "description": "Run LATER.md tasks automatically near window end, with limit-aware auto-resume.",
+  "author": {
+    "name": "vaddisrinivas",
+    "url": "https://github.com/vaddisrinivas"
+  }
 }
