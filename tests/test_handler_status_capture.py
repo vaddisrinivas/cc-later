@@ -53,7 +53,8 @@ class HandlerStatusCaptureTests(unittest.TestCase):
                 self.assertIn("(P1) update readme flags", text)
                 self.assertIn("(P0) fix auth bypass", text)
 
-                with patch("cc_later.core._spawn_dispatch", return_value=12345):
+                with patch("cc_later.core._spawn_dispatch", return_value=12345), \
+                     patch("cc_later.core.compute_budget_state", return_value=core.BudgetState(used_tokens=0, pct_used=0.0)):
                     code = core.run_handler(json.dumps({"cwd": str(repo), "session_id": "s1"}))
                 self.assertEqual(code, 0)
 

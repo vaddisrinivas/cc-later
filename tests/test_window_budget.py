@@ -21,15 +21,15 @@ class WindowBudgetTests(unittest.TestCase):
             self._write_jsonl(
                 f,
                 [
-                    {"timestamp": "2026-04-05T09:00:00Z", "usage": {"input_tokens": 999, "output_tokens": 999}},
-                    {"timestamp": "2026-04-05T14:30:00Z", "usage": {"input_tokens": 20, "output_tokens": 10}},
+                    {"timestamp": "2026-04-05T09:00:00Z", "message": {"usage": {"input_tokens": 999, "output_tokens": 999}}},
+                    {"timestamp": "2026-04-05T15:50:00Z", "message": {"usage": {"input_tokens": 20, "output_tokens": 10}}},
                 ],
             )
             os.utime(f, (now.timestamp(), now.timestamp()))
             ws = core.compute_window_state([root], now_utc=now)
         self.assertIsNotNone(ws)
-        self.assertEqual(ws.elapsed_minutes, 90)
-        self.assertEqual(ws.remaining_minutes, 210)
+        self.assertEqual(ws.elapsed_minutes, 10)
+        self.assertEqual(ws.remaining_minutes, 290)
         self.assertEqual(ws.total_input_tokens, 20)
         self.assertEqual(ws.total_output_tokens, 10)
 
@@ -39,8 +39,8 @@ class WindowBudgetTests(unittest.TestCase):
             root = Path(td)
             recent = root / "recent.jsonl"
             stale = root / "stale.jsonl"
-            self._write_jsonl(recent, [{"timestamp": "2026-04-05T14:30:00Z", "usage": {"input_tokens": 100, "output_tokens": 40}}])
-            self._write_jsonl(stale, [{"timestamp": "2026-03-01T10:00:00Z", "usage": {"input_tokens": 1000, "output_tokens": 1000}}])
+            self._write_jsonl(recent, [{"timestamp": "2026-04-05T14:30:00Z", "message": {"usage": {"input_tokens": 100, "output_tokens": 40}}}])
+            self._write_jsonl(stale, [{"timestamp": "2026-03-01T10:00:00Z", "message": {"usage": {"input_tokens": 1000, "output_tokens": 1000}}}])
 
             os.utime(recent, (now.timestamp(), now.timestamp()))
             stale_ts = (now - timedelta(days=10)).timestamp()

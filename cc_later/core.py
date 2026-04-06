@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
@@ -14,6 +15,16 @@ from typing import Any
 
 APP_DIR_ENV = "CC_LATER_APP_DIR"
 DEFAULT_WINDOW_MINUTES = 300
+PLAN_WINDOW_MINUTES: dict[str, int] = {
+    "free": 300,
+    "pro": 300,
+    "max": 300,
+    "team": 300,
+    "enterprise": 300,
+    # All plans use a 5-hour (300m) rolling window per Anthropic docs.
+    # Enterprise usage-based plans may behave differently — override
+    # with WINDOW_DURATION_MINUTES if your reset timer doesn't match.
+}
 LIMIT_MARKERS = (
     "rate limit",
     "usage limit",
@@ -57,6 +68,7 @@ class DispatchConfig:
 @dataclass
 class WindowConfig:
     dispatch_mode: str = "window_aware"  # window_aware | time_based | always
+    duration_minutes: int = DEFAULT_WINDOW_MINUTES  # 300 for Max, adjust for Enterprise
     trigger_at_minutes_remaining: int = 30
     idle_grace_period_minutes: int = 10
     fallback_dispatch_hours: list[str] = field(default_factory=list)
@@ -76,13 +88,28 @@ class AutoResumeConfig:
 
 
 @dataclass
+class CompactConfig:
+    enabled: bool = True
+
+
+@dataclass
+class NudgeConfig:
+    enabled: bool = True
+    stale_minutes: int = 10
+    max_retries: int = 2
+
+
+@dataclass
 class Config:
+    plan: str = "max"
     paths: PathsConfig = field(default_factory=PathsConfig)
     later: LaterConfig = field(default_factory=LaterConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
     window: WindowConfig = field(default_factory=WindowConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     auto_resume: AutoResumeConfig = field(default_factory=AutoResumeConfig)
+    compact: CompactConfig = field(default_factory=CompactConfig)
+    nudge: NudgeConfig = field(default_factory=NudgeConfig)
 
 
 @dataclass
@@ -123,6 +150,8 @@ class RepoState:
 @dataclass
 class State:
     last_hook_ts: str | None = None
+    window_start_ts: str | None = None   # set when we detect a fresh window (e.g. after resume dispatch)
+    window_limit_ts: str | None = None   # set when we detect limit exhaustion
     repos: dict[str, RepoState] = field(default_factory=dict)
 
 
@@ -216,6 +245,7 @@ def load_config() -> Config:
 
     raw = _read_env(path)
     cfg = Config()
+    cfg.plan = raw.get("PLAN", cfg.plan).strip().lower()
     cfg.paths.watch = _parse_list(raw.get("PATHS_WATCH", ""))
     cfg.later.path = raw.get("LATER_PATH", cfg.later.path)
     cfg.later.max_entries_per_dispatch = int(raw.get("LATER_MAX_ENTRIES_PER_DISPATCH", cfg.later.max_entries_per_dispatch))
@@ -225,6 +255,12 @@ def load_config() -> Config:
     cfg.dispatch.allow_file_writes = _parse_bool(raw.get("DISPATCH_ALLOW_FILE_WRITES", str(cfg.dispatch.allow_file_writes)))
     cfg.dispatch.output_path = raw.get("DISPATCH_OUTPUT_PATH", cfg.dispatch.output_path)
     cfg.window.dispatch_mode = raw.get("WINDOW_DISPATCH_MODE", cfg.window.dispatch_mode)
+    _dur_raw = raw.get("WINDOW_DURATION_MINUTES", "").strip()
+    if _dur_raw and _dur_raw.lower() != "auto":
+        cfg.window.duration_minutes = int(_dur_raw)
+    else:
+        # Use plan-based default
+        cfg.window.duration_minutes = PLAN_WINDOW_MINUTES.get(cfg.plan, DEFAULT_WINDOW_MINUTES)
     cfg.window.trigger_at_minutes_remaining = int(raw.get("WINDOW_TRIGGER_AT_MINUTES_REMAINING", cfg.window.trigger_at_minutes_remaining))
     cfg.window.idle_grace_period_minutes = int(raw.get("WINDOW_IDLE_GRACE_PERIOD_MINUTES", cfg.window.idle_grace_period_minutes))
     cfg.window.fallback_dispatch_hours = _parse_list(raw.get("WINDOW_FALLBACK_DISPATCH_HOURS", ""))
@@ -233,6 +269,10 @@ def load_config() -> Config:
     cfg.limits.backoff_at_pct = int(raw.get("LIMITS_BACKOFF_AT_PCT", cfg.limits.backoff_at_pct))
     cfg.auto_resume.enabled = _parse_bool(raw.get("AUTO_RESUME_ENABLED", str(cfg.auto_resume.enabled)))
     cfg.auto_resume.min_remaining_minutes = int(raw.get("AUTO_RESUME_MIN_REMAINING_MINUTES", cfg.auto_resume.min_remaining_minutes))
+    cfg.compact.enabled = _parse_bool(raw.get("COMPACT_ENABLED", str(cfg.compact.enabled)))
+    cfg.nudge.enabled = _parse_bool(raw.get("NUDGE_ENABLED", str(cfg.nudge.enabled)))
+    cfg.nudge.stale_minutes = int(raw.get("NUDGE_STALE_MINUTES", cfg.nudge.stale_minutes))
+    cfg.nudge.max_retries = int(raw.get("NUDGE_MAX_RETRIES", cfg.nudge.max_retries))
     _validate_values(cfg)
     return cfg
 
@@ -284,7 +324,12 @@ def load_state() -> State:
                 resume_reason=_coerce_str(raw_repo.get("resume_reason")),
                 dispatch_ts=_coerce_str(raw_repo.get("dispatch_ts")),
             )
-    return State(last_hook_ts=_coerce_str(payload.get("last_hook_ts")), repos=repos)
+    return State(
+        last_hook_ts=_coerce_str(payload.get("last_hook_ts")),
+        window_start_ts=_coerce_str(payload.get("window_start_ts")),
+        window_limit_ts=_coerce_str(payload.get("window_limit_ts")),
+        repos=repos,
+    )
 
 
 def save_state(state: State) -> None:
@@ -467,18 +512,88 @@ def resolve_jsonl_roots(cfg: Config) -> list[Path]:
     return out
 
 
-def _jsonl_files(root: Path) -> list[Path]:
+def _jsonl_files(root: Path, recursive: bool = False) -> list[Path]:
+    """Return JSONL files under root.
+
+    By default only returns top-level session files (non-recursive) to avoid
+    pulling in subagent logs that skew window/budget calculations.
+    Use recursive=True when you genuinely need all files (e.g. budget totals).
+    """
     if not root.exists():
         return []
-    return [root] if root.is_file() else list(root.rglob("*.jsonl"))
+    if root.is_file():
+        return [root]
+    # Top-level: only direct children of each project directory
+    if recursive:
+        return list(root.rglob("*.jsonl"))
+    results: list[Path] = []
+    for project_dir in root.iterdir():
+        if project_dir.is_dir():
+            results.extend(project_dir.glob("*.jsonl"))
+        elif project_dir.suffix == ".jsonl":
+            results.append(project_dir)
+    return results
 
 
-def compute_window_state(roots: list[Path], now_utc: datetime, session_id: str | None = None) -> WindowState | None:
+def _auto_detect_window_duration(roots: list[Path], now_utc: datetime, gap_minutes: int = 30) -> int:
+    """Infer window duration from the longest continuous session in the last 7 days.
+
+    Scans all JSONL files, groups rows into sessions (split by gaps ≥ gap_minutes),
+    and returns the longest session length rounded up to the nearest 30 minutes.
+    Falls back to DEFAULT_WINDOW_MINUTES if insufficient data.
+    """
+    cutoff = now_utc - timedelta(days=7)
+    all_ts: list[datetime] = []
+    for root in roots:
+        for fp in _jsonl_files(root):
+            try:
+                mtime = datetime.fromtimestamp(fp.stat().st_mtime, tz=timezone.utc)
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            for row in _iter_jsonl(fp):
+                ts = _row_timestamp(row)
+                if ts is not None and ts >= cutoff:
+                    all_ts.append(ts)
+
+    if len(all_ts) < 10:
+        return DEFAULT_WINDOW_MINUTES
+
+    all_ts.sort()
+    max_session = 0
+    session_start = all_ts[0]
+    for i in range(1, len(all_ts)):
+        gap = (all_ts[i] - all_ts[i - 1]).total_seconds() / 60
+        if gap >= gap_minutes:
+            length = int((all_ts[i - 1] - session_start).total_seconds() / 60)
+            max_session = max(max_session, length)
+            session_start = all_ts[i]
+    # Final session
+    length = int((all_ts[-1] - session_start).total_seconds() / 60)
+    max_session = max(max_session, length)
+
+    if max_session < 60:
+        return DEFAULT_WINDOW_MINUTES
+
+    # Round up to nearest 30 minutes
+    rounded = ((max_session + 29) // 30) * 30
+    return rounded
+
+
+def _resolve_window_duration(cfg_duration: int, roots: list[Path], now_utc: datetime) -> int:
+    """Return window duration: use config value if set, otherwise auto-detect."""
+    if cfg_duration > 0:
+        return cfg_duration
+    return _auto_detect_window_duration(roots, now_utc)
+
+
+def compute_window_state(roots: list[Path], now_utc: datetime, session_id: str | None = None, session_gap_minutes: int = 30, window_duration: int = DEFAULT_WINDOW_MINUTES, window_start_hint: datetime | None = None) -> WindowState | None:
     cutoff = now_utc - timedelta(hours=5)
     future_cutoff = now_utc + timedelta(minutes=5)
-    earliest: datetime | None = None
-    input_tokens = 0
-    output_tokens = 0
+
+    # Collect all timestamped rows within the last 5 hours
+    timed_rows: list[tuple[datetime, dict]] = []
     for root in roots:
         for fp in _jsonl_files(root):
             if session_id and session_id not in fp.name and session_id not in str(fp):
@@ -493,17 +608,66 @@ def compute_window_state(roots: list[Path], now_utc: datetime, session_id: str |
                 ts = _row_timestamp(row)
                 if ts is None or ts < cutoff or ts > future_cutoff:
                     continue
-                earliest = ts if earliest is None or ts < earliest else earliest
-                usage = row.get("message_usage") or row.get("usage") or {}
-                if isinstance(usage, dict):
-                    input_tokens += _as_int(usage.get("input_tokens")) + _as_int(usage.get("cache_creation_input_tokens"))
-                    output_tokens += _as_int(usage.get("output_tokens"))
-    if earliest is None:
+                timed_rows.append((ts, row))
+
+    if not timed_rows:
         return None
+
+    # Sort by timestamp and find the start of the current session by detecting
+    # the last gap larger than session_gap_minutes between consecutive rows.
+    # Everything after the last gap belongs to the current window.
+    timed_rows.sort(key=lambda x: x[0])
+
+    # If the most recent row is older than the gap threshold, the current session
+    # hasn't produced any JSONL rows yet — treat as a fresh window.
+    last_row_age = (now_utc - timed_rows[-1][0]).total_seconds() / 60
+    if last_row_age >= session_gap_minutes:
+        return None
+
+    # Determine window start from best available signal:
+    # 1. window_start_hint (from auto-resume dispatch — most accurate)
+    # 2. Last gap >= session_gap_minutes (gap-based detection)
+    # 3. Clamp: window can be at most window_duration old
+    session_start_idx = 0
+    for i in range(1, len(timed_rows)):
+        gap = (timed_rows[i][0] - timed_rows[i - 1][0]).total_seconds() / 60
+        if gap >= session_gap_minutes:
+            session_start_idx = i
+
+    gap_start = timed_rows[session_start_idx][0]
+    max_start = now_utc - timedelta(minutes=window_duration)
+
+    if window_start_hint is not None and window_start_hint > max_start:
+        # Use the known window start from auto-resume
+        earliest = window_start_hint
+    else:
+        # Use gap detection, but clamp so window never exceeds duration
+        earliest = max(gap_start, max_start)
+
+    # Filter rows to only those in the current window
+    current_rows = [(ts, row) for ts, row in timed_rows if ts >= earliest]
+    if not current_rows:
+        current_rows = timed_rows[session_start_idx:]
+        earliest = current_rows[0][0]
+
+    input_tokens = 0
+    output_tokens = 0
+    for _, row in current_rows:
+        msg = row.get("message")
+        usage = (
+            (msg.get("usage") if isinstance(msg, dict) else None)
+            or row.get("message_usage")
+            or row.get("usage")
+            or {}
+        )
+        if isinstance(usage, dict):
+            input_tokens += _as_int(usage.get("input_tokens")) + _as_int(usage.get("cache_creation_input_tokens"))
+            output_tokens += _as_int(usage.get("output_tokens"))
+
     elapsed = max(0, int((now_utc - earliest).total_seconds() // 60))
     return WindowState(
         elapsed_minutes=elapsed,
-        remaining_minutes=max(0, DEFAULT_WINDOW_MINUTES - elapsed),
+        remaining_minutes=max(0, window_duration - elapsed),
         total_input_tokens=input_tokens,
         total_output_tokens=output_tokens,
     )
@@ -521,7 +685,13 @@ def compute_budget_state(roots: list[Path], now_utc: datetime, weekly_budget: in
             if mtime < cutoff:
                 continue
             for row in _iter_jsonl(fp):
-                usage = row.get("message_usage") or row.get("usage") or {}
+                msg = row.get("message")
+                usage = (
+                    (msg.get("usage") if isinstance(msg, dict) else None)
+                    or row.get("message_usage")
+                    or row.get("usage")
+                    or {}
+                )
                 if isinstance(usage, dict):
                     used += _as_int(usage.get("input_tokens"))
                     used += _as_int(usage.get("cache_creation_input_tokens"))
@@ -743,16 +913,52 @@ def _ensure_gitignore(repo: Path, later_path: str) -> None:
             pass
 
 
+def _is_agent_stale(agent: dict[str, Any], now_utc: datetime, stale_minutes: int) -> bool:
+    """Check if a live agent has produced no output progress for too long."""
+    result_path_str = _coerce_str(agent.get("result_path"))
+    if result_path_str:
+        rp = Path(result_path_str).expanduser()
+        if rp.exists():
+            try:
+                mtime = datetime.fromtimestamp(rp.stat().st_mtime, tz=timezone.utc)
+                return (now_utc - mtime).total_seconds() / 60 >= stale_minutes
+            except OSError:
+                pass
+    # No result file yet — check dispatch time
+    dispatch_ts = _parse_iso(agent.get("dispatch_ts"))
+    if dispatch_ts:
+        return (now_utc - dispatch_ts).total_seconds() / 60 >= stale_minutes
+    return False
+
+
+def _kill_agent(pid: int | None) -> None:
+    if pid is None:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
 def _reconcile(cfg: Config, state: State, now_utc: datetime) -> int:
     completed = 0
     for repo_key, repo_state in state.repos.items():
         if not repo_state.in_flight:
             continue
         remaining: list[dict[str, Any]] = []
+        nudge_queue: list[dict[str, Any]] = []
         for agent in repo_state.agents:
             pid = _coerce_int(agent.get("pid"))
+            retries = int(agent.get("retries", 0))
+
             if _is_process_alive(pid):
-                remaining.append(agent)
+                # Nudge: check if alive but stale
+                if cfg.nudge.enabled and retries < cfg.nudge.max_retries and _is_agent_stale(agent, now_utc, cfg.nudge.stale_minutes):
+                    _kill_agent(pid)
+                    log_event("nudge_stale", repo=repo_key, pid=pid, section=agent.get("section_name"), retries=retries)
+                    nudge_queue.append(agent)
+                else:
+                    remaining.append(agent)
                 continue
 
             entries = [Task.from_dict(e) for e in agent.get("entries", []) if isinstance(e, dict)]
@@ -763,11 +969,17 @@ def _reconcile(cfg: Config, state: State, now_utc: datetime) -> int:
 
             raw = _safe_read(Path(result_path_str).expanduser()) if result_path_str else None
             if raw is None:
-                # No output — agent may have crashed; try to merge/clean up worktree anyway
-                if branch and worktree_path_str:
-                    ok, _ = _merge_worktree(Path(repo_key), branch, Path(worktree_path_str), section_name)
-                    if not ok:
-                        log_event("merge_conflict", repo=repo_key, branch=branch, section=section_name, files=[])
+                # No output — agent crashed. Nudge: re-queue if retries remain
+                if cfg.nudge.enabled and retries < cfg.nudge.max_retries:
+                    log_event("nudge_dead", repo=repo_key, pid=pid, section=section_name, retries=retries)
+                    nudge_queue.append(agent)
+                else:
+                    # Exhausted retries or nudge disabled — clean up
+                    if branch and worktree_path_str:
+                        ok, _ = _merge_worktree(Path(repo_key), branch, Path(worktree_path_str), section_name)
+                        if not ok:
+                            log_event("merge_conflict", repo=repo_key, branch=branch, section=section_name, files=[])
+                    log_event("agent_abandoned", repo=repo_key, pid=pid, section=section_name, retries=retries)
                 completed += 1
                 continue
 
@@ -797,6 +1009,8 @@ def _reconcile(cfg: Config, state: State, now_utc: datetime) -> int:
                     )
 
             reason = detect_limit_exhaustion(raw)
+            if reason:
+                state.window_limit_ts = now_utc.isoformat()
             if cfg.auto_resume.enabled and reason:
                 resume = [e for e in entries if statuses.get(e.id) in {"FAILED", "NEEDS_HUMAN"}]
                 if resume:
@@ -815,6 +1029,54 @@ def _reconcile(cfg: Config, state: State, now_utc: datetime) -> int:
                     if updated != content:
                         later_path.write_text(updated, encoding="utf-8")
             completed += 1
+
+        # Re-dispatch nudged agents
+        for agent in nudge_queue:
+            retries = int(agent.get("retries", 0)) + 1
+            entries = [Task.from_dict(e) for e in agent.get("entries", []) if isinstance(e, dict)]
+            section_name = _coerce_str(agent.get("section_name")) or ""
+            old_branch = _coerce_str(agent.get("branch"))
+            old_wt = _coerce_str(agent.get("worktree_path"))
+
+            # Clean up old worktree if any
+            if old_branch and old_wt:
+                _cleanup_worktree(Path(repo_key), old_branch, Path(old_wt))
+
+            timestamp = now_utc.strftime("%Y%m%d-%H%M%S")
+            section_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", section_name) if section_name else "default"
+            result_path = _result_path(cfg.dispatch.output_path, Path(repo_key), now_utc, f"{section_slug}-r{retries}")
+            prompt = _render_prompt(Path(repo_key), entries, cfg.dispatch.allow_file_writes, section_name=section_name or None)
+
+            branch: str | None = None
+            worktree_path: Path | None = None
+            cwd = Path(repo_key)
+            if cfg.dispatch.allow_file_writes:
+                wt = _create_worktree(Path(repo_key), section_slug, timestamp)
+                if wt:
+                    worktree_path, branch = wt
+                    cwd = worktree_path
+
+            pid = _spawn_dispatch(cfg, Path(repo_key), prompt, result_path, cwd=cwd)
+            if pid is not None:
+                remaining.append({
+                    "section_name": section_name,
+                    "pid": pid,
+                    "result_path": str(result_path),
+                    "entries": [t.to_dict() for t in entries],
+                    "branch": branch,
+                    "worktree_path": str(worktree_path) if worktree_path else None,
+                    "dispatch_ts": now_utc.isoformat(),
+                    "retries": retries,
+                })
+                log_event(
+                    "nudge_redispatch",
+                    repo=repo_key,
+                    section=section_name,
+                    retries=retries,
+                    pid=pid,
+                )
+            elif worktree_path and branch:
+                _cleanup_worktree(Path(repo_key), branch, worktree_path)
 
         repo_state.agents = remaining
         repo_state.in_flight = bool(remaining)
@@ -876,7 +1138,26 @@ def run_handler(stdin_text: str | None = None) -> int:
         return 0
 
     session_id = payload.get("session_id") or payload.get("sessionId")
-    window_state = compute_window_state(roots, now_utc, session_id=str(session_id) if session_id else None)
+    window_start_hint = _parse_iso(state.window_start_ts)
+    window_state = compute_window_state(roots, now_utc, session_id=str(session_id) if session_id else None, window_duration=cfg.window.duration_minutes, window_start_hint=window_start_hint)
+
+    # Self-calibrating window detection:
+    # 1. If window is exhausted → record limit timestamp
+    # 2. If we previously recorded a limit AND enough time has passed → window has reset
+    if window_state is not None:
+        if window_state.remaining_minutes <= 0 and state.window_limit_ts is None:
+            state.window_limit_ts = now_utc.isoformat()
+            log_event("window_exhausted")
+
+        limit_ts = _parse_iso(state.window_limit_ts)
+        if limit_ts is not None and (now_utc - limit_ts).total_seconds() / 60 > cfg.window.idle_grace_period_minutes:
+            # Activity after a limit hit → fresh window. The current moment is the new window start.
+            state.window_start_ts = now_utc.isoformat()
+            state.window_limit_ts = None
+            log_event("window_reset_detected")
+            # Recompute with updated hint
+            window_state = compute_window_state(roots, now_utc, session_id=str(session_id) if session_id else None, window_duration=cfg.window.duration_minutes, window_start_hint=now_utc)
+
     mode_open = _mode_gate_open(cfg, now_local, window_state)
     resume_open = _auto_resume_gate_open(cfg, watch_paths, state, window_state)
     if not mode_open and not resume_open:
@@ -901,6 +1182,9 @@ def run_handler(stdin_text: str | None = None) -> int:
         timestamp = now_utc.strftime("%Y%m%d-%H%M%S")
 
         if resume_open and repo_state.resume_entries:
+            # Fresh window detected — auto-resume is dispatching
+            state.window_start_ts = now_utc.isoformat()
+            state.window_limit_ts = None
             selected = [Task.from_dict(item) for item in repo_state.resume_entries if isinstance(item, dict)]
             if selected:
                 result_path = _result_path(cfg.dispatch.output_path, repo, now_utc)
@@ -922,6 +1206,8 @@ def run_handler(stdin_text: str | None = None) -> int:
                         "entries": [t.to_dict() for t in selected],
                         "branch": branch,
                         "worktree_path": str(worktree_path) if worktree_path else None,
+                        "dispatch_ts": now_utc.isoformat(),
+                        "retries": 0,
                     })
                     repo_state.resume_entries = []
                     repo_state.resume_reason = None
@@ -976,6 +1262,8 @@ def run_handler(stdin_text: str | None = None) -> int:
                 "entries": [t.to_dict() for t in selected],
                 "branch": branch,
                 "worktree_path": str(worktree_path) if worktree_path else None,
+                "dispatch_ts": now_utc.isoformat(),
+                "retries": 0,
             })
             dispatched += 1
             log_event(
@@ -1006,7 +1294,8 @@ def build_status(cwd_hint: str | None = None) -> str:
     now_utc = datetime.now(timezone.utc)
     now_local = now_utc.astimezone()
     roots = resolve_jsonl_roots(cfg)
-    window_state = compute_window_state(roots, now_utc)
+    window_start_hint = _parse_iso(state.window_start_ts)
+    window_state = compute_window_state(roots, now_utc, window_duration=cfg.window.duration_minutes, window_start_hint=window_start_hint)
     budget = compute_budget_state(roots, now_utc, cfg.limits.weekly_budget_tokens)
     watch_paths = resolve_watch_paths(cfg, cwd_hint)
 
@@ -1076,6 +1365,168 @@ def build_status(cwd_hint: str | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def run_compact_inject(cwd_hint: str | None = None) -> int:
+    """Output LATER.md context for injection after compaction (SessionStart/compact hook)."""
+    cfg = load_config()
+    if not cfg.compact.enabled:
+        return 0
+
+    now_utc = datetime.now(timezone.utc)
+    state = load_state()
+    roots = resolve_jsonl_roots(cfg)
+    window_start_hint = _parse_iso(state.window_start_ts)
+    window_state = compute_window_state(roots, now_utc, window_duration=cfg.window.duration_minutes, window_start_hint=window_start_hint)
+    watch_paths = resolve_watch_paths(cfg, cwd_hint)
+    state = load_state()
+
+    lines = ["=== cc-later context (post-compaction) ==="]
+
+    if window_state is None:
+        lines.append("Window: unknown (fresh window)")
+    else:
+        lines.append(
+            f"Window: {window_state.remaining_minutes}m remaining"
+            f" ({cfg.window.dispatch_mode}, {window_state.elapsed_minutes}m elapsed)"
+        )
+
+    lines.append("")
+    has_tasks = False
+    for repo in watch_paths:
+        repo_state = state.repos.get(str(repo), RepoState())
+        later_file = repo / cfg.later.path
+        if not later_file.exists():
+            continue
+        sections = parse_tasks(_safe_read(later_file) or "")
+        pending = [s for s in sections if s.tasks]
+        if not pending:
+            continue
+        has_tasks = True
+        total = sum(len(s.tasks) for s in pending)
+        lines.append(f"Pending LATER.md tasks ({total}) — {repo.name}/:")
+        for section in pending:
+            if section.name:
+                lines.append(f"  ## {section.name}")
+            for task in section.tasks:
+                lines.append(f"  - [ ] ({task.priority}) {task.text}")
+        if repo_state.in_flight:
+            lines.append(f"  [dispatch in progress: {len(repo_state.agents)} agent(s)]")
+        if repo_state.resume_entries:
+            lines.append(f"  [auto-resume queued: {len(repo_state.resume_entries)} task(s)]")
+
+    if not has_tasks:
+        lines.append("LATER.md queue: empty")
+
+    print("\n".join(lines))
+    return 0
+
+
+# -- Pricing per million tokens (USD) --
+_MODEL_PRICING: dict[str, dict[str, float]] = {
+    "claude-opus-4-6": {"input": 15.0, "cache_create": 18.75, "cache_read": 1.50, "output": 75.0},
+    "claude-opus-4-5": {"input": 15.0, "cache_create": 18.75, "cache_read": 1.50, "output": 75.0},
+    "claude-sonnet-4-6": {"input": 3.0, "cache_create": 3.75, "cache_read": 0.30, "output": 15.0},
+    "claude-sonnet-4-5": {"input": 3.0, "cache_create": 3.75, "cache_read": 0.30, "output": 15.0},
+    "claude-haiku-4-5": {"input": 0.80, "cache_create": 1.0, "cache_read": 0.08, "output": 4.0},
+}
+_DEFAULT_PRICING = {"input": 3.0, "cache_create": 3.75, "cache_read": 0.30, "output": 15.0}
+
+
+def _normalize_model(model: str) -> str:
+    """Normalize model ID to a pricing key (strip date suffixes)."""
+    for key in _MODEL_PRICING:
+        if model.startswith(key):
+            return key
+    return model
+
+
+def run_stats(days: int = 7) -> int:
+    """Print detailed token analytics with per-model cost breakdown."""
+    cfg = load_config()
+    roots = resolve_jsonl_roots(cfg)
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(days=days)
+
+    # Accumulators: model -> {input, cache_create, cache_read, output}
+    by_model: dict[str, dict[str, int]] = {}
+    session_ids: set[str] = set()
+    file_count = 0
+
+    for root in roots:
+        for fp in _jsonl_files(root, recursive=True):
+            try:
+                mtime = datetime.fromtimestamp(fp.stat().st_mtime, tz=timezone.utc)
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            file_count += 1
+            for row in _iter_jsonl(fp):
+                sid = row.get("sessionId")
+                if sid:
+                    session_ids.add(sid)
+                msg = row.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                model_raw = msg.get("model") or "unknown"
+                model_key = _normalize_model(model_raw)
+                usage = msg.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                bucket = by_model.setdefault(model_key, {"input": 0, "cache_create": 0, "cache_read": 0, "output": 0})
+                bucket["input"] += _as_int(usage.get("input_tokens"))
+                bucket["cache_create"] += _as_int(usage.get("cache_creation_input_tokens"))
+                bucket["cache_read"] += _as_int(usage.get("cache_read_input_tokens"))
+                bucket["output"] += _as_int(usage.get("output_tokens"))
+
+    lines = [f"## cc-later Stats ({days}d)", ""]
+
+    total_cost = 0.0
+    total_input = total_cc = total_cr = total_output = 0
+    for model_key in sorted(by_model.keys()):
+        b = by_model[model_key]
+        if not any(b.values()):
+            continue
+        pricing = _MODEL_PRICING.get(model_key, _DEFAULT_PRICING)
+        cost = (
+            b["input"] * pricing["input"] / 1_000_000
+            + b["cache_create"] * pricing["cache_create"] / 1_000_000
+            + b["cache_read"] * pricing["cache_read"] / 1_000_000
+            + b["output"] * pricing["output"] / 1_000_000
+        )
+        total_cost += cost
+        total_input += b["input"]
+        total_cc += b["cache_create"]
+        total_cr += b["cache_read"]
+        total_output += b["output"]
+        lines.append(f"### {model_key}")
+        lines.append(f"  Input:          {b['input']:>15,}")
+        lines.append(f"  Cache creation: {b['cache_create']:>15,}")
+        lines.append(f"  Cache read:     {b['cache_read']:>15,}")
+        lines.append(f"  Output:         {b['output']:>15,}")
+        lines.append(f"  API cost:       ${cost:>14,.2f}")
+        lines.append("")
+
+    grand = total_input + total_cc + total_cr + total_output
+    lines.append("### Totals")
+    lines.append(f"  Input:          {total_input:>15,}")
+    lines.append(f"  Cache creation: {total_cc:>15,}")
+    lines.append(f"  Cache read:     {total_cr:>15,}")
+    lines.append(f"  Output:         {total_output:>15,}")
+    lines.append(f"  Grand total:    {grand:>15,}  (~{grand/1_000_000:.1f}M)")
+    lines.append(f"  API equiv cost: ${total_cost:>14,.2f}")
+    lines.append(f"  Sessions:       {len(session_ids):>15,}")
+    lines.append(f"  JSONL files:    {file_count:>15,}")
+    sub_cost = days / 30 * 200  # Max plan prorated
+    lines.append("")
+    lines.append(f"  Max plan cost:  ${sub_cost:>14,.2f}  ({days}d @ $200/mo)")
+    if total_cost > 0:
+        savings_pct = (1 - sub_cost / total_cost) * 100
+        lines.append(f"  Savings:        {savings_pct:>14.0f}%")
+
+    print("\n".join(lines))
+    return 0
+
+
 def run_status() -> int:
     print(build_status())
     return 0
@@ -1115,10 +1566,12 @@ __all__ = [
     "APP_DIR_ENV",
     "AutoResumeConfig",
     "BudgetState",
+    "CompactConfig",
     "Config",
     "DispatchConfig",
     "LaterConfig",
     "LimitsConfig",
+    "NudgeConfig",
     "PathsConfig",
     "RepoState",
     "Section",
@@ -1138,7 +1591,9 @@ __all__ = [
     "parse_result_summary",
     "parse_tasks",
     "resolve_watch_paths",
+    "run_compact_inject",
     "run_handler",
+    "run_stats",
     "run_status",
     "save_state",
     "select_tasks",
