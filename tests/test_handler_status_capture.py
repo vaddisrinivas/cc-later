@@ -65,6 +65,7 @@ class HandlerStatusCaptureTests(unittest.TestCase):
                 result_path = Path(rs.agents[0]["result_path"])
 
                 first_task = core.Task.from_dict(rs.agents[0]["entries"][0])
+                result_path.parent.mkdir(parents=True, exist_ok=True)
                 result_path.write_text(f"DONE {first_task.id}: done\n", encoding="utf-8")
 
                 with patch("cc_later.core._spawn_dispatch", return_value=None):
