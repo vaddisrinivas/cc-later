@@ -22,8 +22,7 @@ PLAN_WINDOW_MINUTES: dict[str, int] = {
     "team": 300,
     "enterprise": 300,
     # All plans use a 5-hour (300m) rolling window per Anthropic docs.
-    # Enterprise usage-based plans may behave differently — override
-    # with WINDOW_DURATION_MINUTES if your reset timer doesn't match.
+    # Enterprise/usage-based plans may differ — override with WINDOW_DURATION_MINUTES.
 }
 LIMIT_MARKERS = (
     "rate limit",
@@ -234,6 +233,8 @@ def _validate_values(cfg: Config) -> None:
         raise ValueError("auto_resume.min_remaining_minutes must be >= 0")
     if cfg.later.max_entries_per_dispatch <= 0:
         raise ValueError("later.max_entries_per_dispatch must be > 0")
+    if cfg.plan not in PLAN_WINDOW_MINUTES:
+        raise ValueError(f"plan must be one of: {', '.join(sorted(PLAN_WINDOW_MINUTES))}")
 
 
 def load_config() -> Config:
@@ -336,6 +337,8 @@ def save_state(state: State) -> None:
     app_dir().mkdir(parents=True, exist_ok=True)
     payload = {
         "last_hook_ts": state.last_hook_ts,
+        "window_start_ts": state.window_start_ts,
+        "window_limit_ts": state.window_limit_ts,
         "repos": {repo: asdict(repo_state) for repo, repo_state in state.repos.items()},
     }
     state_path().write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -534,58 +537,6 @@ def _jsonl_files(root: Path, recursive: bool = False) -> list[Path]:
             results.append(project_dir)
     return results
 
-
-def _auto_detect_window_duration(roots: list[Path], now_utc: datetime, gap_minutes: int = 30) -> int:
-    """Infer window duration from the longest continuous session in the last 7 days.
-
-    Scans all JSONL files, groups rows into sessions (split by gaps ≥ gap_minutes),
-    and returns the longest session length rounded up to the nearest 30 minutes.
-    Falls back to DEFAULT_WINDOW_MINUTES if insufficient data.
-    """
-    cutoff = now_utc - timedelta(days=7)
-    all_ts: list[datetime] = []
-    for root in roots:
-        for fp in _jsonl_files(root):
-            try:
-                mtime = datetime.fromtimestamp(fp.stat().st_mtime, tz=timezone.utc)
-            except OSError:
-                continue
-            if mtime < cutoff:
-                continue
-            for row in _iter_jsonl(fp):
-                ts = _row_timestamp(row)
-                if ts is not None and ts >= cutoff:
-                    all_ts.append(ts)
-
-    if len(all_ts) < 10:
-        return DEFAULT_WINDOW_MINUTES
-
-    all_ts.sort()
-    max_session = 0
-    session_start = all_ts[0]
-    for i in range(1, len(all_ts)):
-        gap = (all_ts[i] - all_ts[i - 1]).total_seconds() / 60
-        if gap >= gap_minutes:
-            length = int((all_ts[i - 1] - session_start).total_seconds() / 60)
-            max_session = max(max_session, length)
-            session_start = all_ts[i]
-    # Final session
-    length = int((all_ts[-1] - session_start).total_seconds() / 60)
-    max_session = max(max_session, length)
-
-    if max_session < 60:
-        return DEFAULT_WINDOW_MINUTES
-
-    # Round up to nearest 30 minutes
-    rounded = ((max_session + 29) // 30) * 30
-    return rounded
-
-
-def _resolve_window_duration(cfg_duration: int, roots: list[Path], now_utc: datetime) -> int:
-    """Return window duration: use config value if set, otherwise auto-detect."""
-    if cfg_duration > 0:
-        return cfg_duration
-    return _auto_detect_window_duration(roots, now_utc)
 
 
 def compute_window_state(roots: list[Path], now_utc: datetime, session_id: str | None = None, session_gap_minutes: int = 30, window_duration: int = DEFAULT_WINDOW_MINUTES, window_start_hint: datetime | None = None) -> WindowState | None:
@@ -905,7 +856,8 @@ def _ensure_gitignore(repo: Path, later_path: str) -> None:
     gitignore = repo / ".gitignore"
     existing = _safe_read(gitignore) or ""
     lines = existing.splitlines()
-    if later_path not in lines:
+    stripped = {l.strip().lstrip("/") for l in lines}
+    if later_path not in stripped:
         lines.append(later_path)
         try:
             gitignore.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -1045,7 +997,7 @@ def _reconcile(cfg: Config, state: State, now_utc: datetime) -> int:
             timestamp = now_utc.strftime("%Y%m%d-%H%M%S")
             section_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", section_name) if section_name else "default"
             result_path = _result_path(cfg.dispatch.output_path, Path(repo_key), now_utc, f"{section_slug}-r{retries}")
-            prompt = _render_prompt(Path(repo_key), entries, cfg.dispatch.allow_file_writes, section_name=section_name or None)
+            prompt = _render_prompt(Path(repo_key), entries, cfg.dispatch.allow_file_writes, section_name=section_name)
 
             branch: str | None = None
             worktree_path: Path | None = None
@@ -1351,13 +1303,25 @@ def build_status(cwd_hint: str | None = None) -> str:
 
     lines.extend(["", "### Recent Runs"])
     recent: list[dict[str, Any]] = []
-    for row in (run_log_path().read_text(encoding="utf-8").splitlines() if run_log_path().exists() else []):
-        if not row.strip():
-            continue
+    log_path = run_log_path()
+    if log_path.exists():
+        # Read only the tail (~4KB) to avoid loading the entire append-only log
         try:
-            recent.append(json.loads(row))
-        except json.JSONDecodeError:
-            continue
+            size = log_path.stat().st_size
+            with log_path.open("r", encoding="utf-8") as fh:
+                if size > 4096:
+                    fh.seek(size - 4096)
+                    fh.readline()  # skip partial line
+                for row in fh:
+                    row = row.strip()
+                    if not row:
+                        continue
+                    try:
+                        recent.append(json.loads(row))
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            pass
     for item in recent[-8:][::-1]:
         ts = _parse_iso(item.get("ts"))
         when = ts.astimezone().strftime("%m-%d %H:%M") if ts else "??"
@@ -1377,7 +1341,6 @@ def run_compact_inject(cwd_hint: str | None = None) -> int:
     window_start_hint = _parse_iso(state.window_start_ts)
     window_state = compute_window_state(roots, now_utc, window_duration=cfg.window.duration_minutes, window_start_hint=window_start_hint)
     watch_paths = resolve_watch_paths(cfg, cwd_hint)
-    state = load_state()
 
     lines = ["=== cc-later context (post-compaction) ==="]
 
@@ -1544,15 +1507,22 @@ def capture_from_payload(payload: dict[str, Any]) -> int:
 
     existing = _safe_read(later_file) or ""
     lines = existing.splitlines()
-    lowered = existing.lower()
+    # Extract existing task texts for dedup (not full file content — avoids false positives)
+    existing_tasks: set[str] = set()
+    for line in lines:
+        m = TASK_RE.match(line)
+        if m and m.group("text"):
+            existing_tasks.add(m.group("text").strip().lower())
     added = 0
     for match in CAPTURE_RE.finditer(prompt):
         urgent = bool(match.group(1))
         text = match.group(2).strip().rstrip(".")
-        if len(text) < 3 or text.lower() in lowered:
+        # Strip leading priority markers to avoid doubled priority like (P0) (P0)
+        text = re.sub(r"^\(P[012]\)\s*", "", text).strip()
+        if len(text) < 3 or text.lower() in existing_tasks:
             continue
         lines.append(f"- [ ] ({'P0' if urgent else 'P1'}) {text}")
-        lowered += "\n" + text.lower()
+        existing_tasks.add(text.lower())
         added += 1
 
     if added:
@@ -1598,7 +1568,4 @@ __all__ = [
     "save_state",
     "select_tasks",
     "stable_task_id",
-    "_create_worktree",
-    "_merge_worktree",
-    "_cleanup_worktree",
 ]
