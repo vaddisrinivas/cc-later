@@ -863,5 +863,292 @@ class TestModeGateOpenHardening(unittest.TestCase):
         self.assertFalse(result)
 
 
+# ---------------------------------------------------------------------------
+# Negative tests: window state denial conditions
+# ---------------------------------------------------------------------------
+class TestComputeWindowStateNegative(unittest.TestCase):
+    """Negative tests verifying compute_window_state correctly denies/returns None."""
+
+    def _write_jsonl(self, path: Path, rows: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    def test_empty_roots_returns_none(self):
+        """compute_window_state with roots=[] (no roots) returns None."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        ws = compute_window_state([], now_utc=now)
+        self.assertIsNone(ws)
+
+    def test_roots_pointing_to_empty_directory_returns_none(self):
+        """compute_window_state with roots pointing to an empty directory returns None."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = compute_window_state([root], now_utc=now)
+        self.assertIsNone(ws)
+
+    def test_roots_pointing_to_nonexistent_directory_returns_none(self):
+        """compute_window_state with roots pointing to a non-existent directory returns None."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        ws = compute_window_state([Path("/tmp/nonexistent_cc_later_test_dir_xyz")], now_utc=now)
+        self.assertIsNone(ws)
+
+    def test_all_rows_outside_5h_cutoff_returns_none(self):
+        """compute_window_state with only rows from 6 hours ago (all outside 5h cutoff) returns None."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "s.jsonl"
+            self._write_jsonl(f, [
+                {"timestamp": "2026-04-05T09:00:00Z", "usage": {"input_tokens": 100, "output_tokens": 50}},
+                {"timestamp": "2026-04-05T09:30:00Z", "usage": {"input_tokens": 200, "output_tokens": 100}},
+            ])
+            # Set mtime to recent so file is not skipped by mtime check
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            ws = compute_window_state([root], now_utc=now)
+        self.assertIsNone(ws)
+
+    def test_window_duration_1_activity_from_2_min_ago_remaining_zero(self):
+        """compute_window_state with window_duration=1 and activity from 2 min ago has remaining=0."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "s.jsonl"
+            self._write_jsonl(f, [
+                {"timestamp": "2026-04-05T15:58:00Z", "usage": {"input_tokens": 10, "output_tokens": 5}},
+            ])
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            ws = compute_window_state([root], now_utc=now, window_duration=1)
+        self.assertIsNotNone(ws)
+        self.assertEqual(ws.remaining_minutes, 0)
+
+    def test_all_rows_zero_tokens_elapsed_correct(self):
+        """compute_window_state with all rows having zero tokens yields correct elapsed but 0 tokens."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "s.jsonl"
+            self._write_jsonl(f, [
+                {"timestamp": "2026-04-05T15:30:00Z", "usage": {"input_tokens": 0, "output_tokens": 0}},
+                {"timestamp": "2026-04-05T15:50:00Z", "usage": {"input_tokens": 0, "output_tokens": 0}},
+            ])
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            ws = compute_window_state([root], now_utc=now)
+        self.assertIsNotNone(ws)
+        self.assertEqual(ws.total_input_tokens, 0)
+        self.assertEqual(ws.total_output_tokens, 0)
+        self.assertEqual(ws.elapsed_minutes, 30)  # 15:30 -> 16:00
+
+    def test_only_future_timestamps_returns_none(self):
+        """compute_window_state when JSONL has rows with future timestamps only returns None."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "s.jsonl"
+            self._write_jsonl(f, [
+                {"timestamp": "2026-04-05T17:00:00Z", "usage": {"input_tokens": 100, "output_tokens": 50}},
+                {"timestamp": "2026-04-05T18:00:00Z", "usage": {"input_tokens": 200, "output_tokens": 100}},
+            ])
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            ws = compute_window_state([root], now_utc=now)
+        self.assertIsNone(ws)
+
+    def test_window_start_hint_none_no_gaps_uses_earliest_row(self):
+        """compute_window_state with window_start_hint=None and no gaps uses earliest row."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "s.jsonl"
+            # All gaps < 30 min so they form one session starting at 15:00
+            self._write_jsonl(f, [
+                {"timestamp": "2026-04-05T15:00:00Z", "usage": {"input_tokens": 10, "output_tokens": 5}},
+                {"timestamp": "2026-04-05T15:15:00Z", "usage": {"input_tokens": 20, "output_tokens": 10}},
+                {"timestamp": "2026-04-05T15:35:00Z", "usage": {"input_tokens": 30, "output_tokens": 15}},
+            ])
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            ws = compute_window_state([root], now_utc=now, window_start_hint=None)
+        self.assertIsNotNone(ws)
+        # No gaps >= 30 min, no hint -> uses earliest row at 15:00
+        self.assertEqual(ws.elapsed_minutes, 60)  # 15:00 -> 16:00
+        self.assertEqual(ws.total_input_tokens, 60)
+
+    def test_session_id_filter_matches_no_files_returns_none(self):
+        """compute_window_state when session_id filter matches no files returns None."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "session_abc.jsonl"
+            self._write_jsonl(f, [
+                {"timestamp": "2026-04-05T15:50:00Z", "usage": {"input_tokens": 100, "output_tokens": 50}},
+            ])
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            ws = compute_window_state([root], now_utc=now, session_id="nonexistent_session_xyz")
+        self.assertIsNone(ws)
+
+
+# ---------------------------------------------------------------------------
+# Negative tests: budget denial conditions
+# ---------------------------------------------------------------------------
+class TestComputeBudgetStateNegative(unittest.TestCase):
+    """Negative tests verifying compute_budget_state correctly denies/returns 0."""
+
+    def _write_jsonl(self, path: Path, rows: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    def test_empty_roots_returns_zero(self):
+        """compute_budget_state with roots=[] returns 0 used, 0%."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        bs = compute_budget_state([], now, weekly_budget=10_000_000)
+        self.assertEqual(bs.used_tokens, 0)
+        self.assertAlmostEqual(bs.pct_used, 0.0, places=5)
+
+    def test_nonexistent_dir_returns_zero(self):
+        """compute_budget_state with roots pointing to non-existent dir returns 0."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        bs = compute_budget_state([Path("/tmp/nonexistent_cc_later_budget_test_xyz")], now, weekly_budget=10_000_000)
+        self.assertEqual(bs.used_tokens, 0)
+
+    def test_all_files_older_than_7_days_returns_zero(self):
+        """compute_budget_state with all files older than 7 days returns 0."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "s.jsonl"
+            self._write_jsonl(f, [
+                {"timestamp": "2026-03-01T10:00:00Z", "usage": {"input_tokens": 500, "output_tokens": 250}},
+            ])
+            stale_ts = (now - timedelta(days=10)).timestamp()
+            os.utime(f, (stale_ts, stale_ts))
+            bs = compute_budget_state([root], now, weekly_budget=10_000_000)
+        self.assertEqual(bs.used_tokens, 0)
+
+    def test_weekly_budget_1_and_10_tokens_pct_capped(self):
+        """compute_budget_state with weekly_budget=1 and 10 tokens used -> pct_used capped at 1.0."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "s.jsonl"
+            self._write_jsonl(f, [
+                {"timestamp": "2026-04-05T15:00:00Z", "usage": {"input_tokens": 5, "output_tokens": 5}},
+            ])
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            bs = compute_budget_state([root], now, weekly_budget=1)
+        self.assertEqual(bs.used_tokens, 10)
+        self.assertEqual(bs.pct_used, 1.0)
+
+    def test_rows_with_no_usage_data_returns_zero(self):
+        """compute_budget_state with rows containing no usage data returns 0."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "s.jsonl"
+            self._write_jsonl(f, [
+                {"timestamp": "2026-04-05T15:00:00Z", "some_field": "no usage"},
+                {"timestamp": "2026-04-05T15:10:00Z"},
+            ])
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            bs = compute_budget_state([root], now, weekly_budget=10_000_000)
+        self.assertEqual(bs.used_tokens, 0)
+        self.assertAlmostEqual(bs.pct_used, 0.0, places=5)
+
+
+# ---------------------------------------------------------------------------
+# Negative tests: gate logic denial conditions
+# ---------------------------------------------------------------------------
+class TestModeGateOpenNegative(unittest.TestCase):
+    """Negative tests verifying _mode_gate_open correctly denies dispatch."""
+
+    def test_window_aware_window_state_none_returns_false(self):
+        """_mode_gate_open with window_aware and window_state=None returns False."""
+        cfg = _make_config(window__dispatch_mode="window_aware")
+        self.assertFalse(_mode_gate_open(cfg, datetime.now(), None))
+
+    def test_window_aware_remaining_300_returns_false(self):
+        """_mode_gate_open with window_aware and remaining=300 returns False (full window)."""
+        cfg = _make_config(window__dispatch_mode="window_aware", window__trigger_at_minutes_remaining=30)
+        ws = WindowState(elapsed_minutes=0, remaining_minutes=300, total_input_tokens=0, total_output_tokens=0)
+        self.assertFalse(_mode_gate_open(cfg, datetime.now(), ws))
+
+    def test_window_aware_remaining_zero_returns_true(self):
+        """_mode_gate_open with window_aware and remaining=0 returns True (window exhausted)."""
+        cfg = _make_config(window__dispatch_mode="window_aware", window__trigger_at_minutes_remaining=30)
+        ws = WindowState(elapsed_minutes=300, remaining_minutes=0, total_input_tokens=0, total_output_tokens=0)
+        self.assertTrue(_mode_gate_open(cfg, datetime.now(), ws))
+
+    def test_time_based_empty_fallback_hours_returns_false(self):
+        """_mode_gate_open with time_based and empty fallback_dispatch_hours returns False."""
+        cfg = _make_config(window__dispatch_mode="time_based", window__fallback_dispatch_hours=[])
+        self.assertFalse(_mode_gate_open(cfg, datetime(2026, 4, 5, 12, 0), None))
+
+
+class TestAutoResumeGateOpenNegative(unittest.TestCase):
+    """Negative tests verifying _auto_resume_gate_open correctly denies dispatch."""
+
+    def _state_with_resume(self, repo_path: str, entries: list[dict]) -> State:
+        return State(repos={repo_path: RepoState(resume_entries=entries)})
+
+    def test_window_aware_window_state_none_returns_false(self):
+        """_auto_resume_gate_open with window_aware and window_state=None returns False."""
+        cfg = _make_config(
+            auto_resume__enabled=True,
+            auto_resume__min_remaining_minutes=240,
+            window__dispatch_mode="window_aware",
+        )
+        repo = Path("/tmp/fake-repo-neg")
+        state = self._state_with_resume(str(repo), [{"task": "resume_me"}])
+        self.assertFalse(_auto_resume_gate_open(cfg, [repo], state, None))
+
+    def test_auto_resume_disabled_returns_false(self):
+        """_auto_resume_gate_open with resume entries but auto_resume disabled returns False."""
+        cfg = _make_config(auto_resume__enabled=False, window__dispatch_mode="window_aware")
+        repo = Path("/tmp/fake-repo-neg")
+        state = self._state_with_resume(str(repo), [{"task": "resume_me"}])
+        ws = WindowState(elapsed_minutes=30, remaining_minutes=270, total_input_tokens=0, total_output_tokens=0)
+        self.assertFalse(_auto_resume_gate_open(cfg, [repo], state, ws))
+
+    def test_remaining_below_min_returns_false(self):
+        """_auto_resume_gate_open with resume entries but remaining < min_remaining returns False."""
+        cfg = _make_config(
+            auto_resume__enabled=True,
+            auto_resume__min_remaining_minutes=240,
+            window__dispatch_mode="window_aware",
+        )
+        repo = Path("/tmp/fake-repo-neg")
+        state = self._state_with_resume(str(repo), [{"task": "resume_me"}])
+        ws = WindowState(elapsed_minutes=200, remaining_minutes=100, total_input_tokens=0, total_output_tokens=0)
+        self.assertFalse(_auto_resume_gate_open(cfg, [repo], state, ws))
+
+    def test_empty_resume_entries_across_all_repos_returns_false(self):
+        """_auto_resume_gate_open with empty resume entries across ALL repos returns False."""
+        cfg = _make_config(
+            auto_resume__enabled=True,
+            auto_resume__min_remaining_minutes=240,
+            window__dispatch_mode="window_aware",
+        )
+        repo1 = Path("/tmp/fake-repo1-neg")
+        repo2 = Path("/tmp/fake-repo2-neg")
+        state = State(repos={
+            str(repo1): RepoState(resume_entries=[]),
+            str(repo2): RepoState(resume_entries=[]),
+        })
+        ws = WindowState(elapsed_minutes=30, remaining_minutes=270, total_input_tokens=0, total_output_tokens=0)
+        self.assertFalse(_auto_resume_gate_open(cfg, [repo1, repo2], state, ws))
+
+
+class TestInTimeWindowsNegative(unittest.TestCase):
+    """Negative tests verifying _in_time_windows correctly denies."""
+
+    def test_current_time_exactly_at_window_end_exclusive(self):
+        """_in_time_windows with current time exactly at window end returns False (exclusive)."""
+        dt = datetime(2026, 4, 5, 17, 0)
+        self.assertFalse(_in_time_windows(dt, ["09:00-17:00"]))
+
+    def test_single_invalid_entry_garbage_returns_false(self):
+        """_in_time_windows with single invalid entry 'garbage' returns False."""
+        dt = datetime(2026, 4, 5, 12, 0)
+        self.assertFalse(_in_time_windows(dt, ["garbage"]))
+
+
 if __name__ == "__main__":
     unittest.main()

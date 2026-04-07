@@ -1220,5 +1220,147 @@ class IsAgentStaleHardeningTests(_Base):
         self.assertFalse(result)
 
 
+# ---------------------------------------------------------------------------
+# Negative tests: reconcile denial conditions
+# ---------------------------------------------------------------------------
+class ReconcileNegativeTests(_Base):
+    """Negative tests verifying _reconcile correctly handles denial/edge conditions."""
+
+    def test_no_in_flight_repos_returns_zero(self):
+        """_reconcile returns 0 when no repos have in_flight=True."""
+        with tempfile.TemporaryDirectory() as app, tempfile.TemporaryDirectory() as repo_dir:
+            app_dir, repo = Path(app), Path(repo_dir)
+            self._setup_repo(repo)
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app_dir)}, clear=False):
+                self._write_config(app_dir, repo)
+                cfg = core.load_config()
+                state = core.State()
+                state.repos[str(repo)] = core.RepoState(in_flight=False, agents=[])
+                result = core._reconcile(cfg, state, datetime.now(timezone.utc))
+                self.assertEqual(result, 0)
+
+    @patch.object(core, "_spawn_dispatch")
+    @patch.object(core, "_is_process_alive", return_value=False)
+    def test_nudge_disabled_does_not_redispatch(self, _, mock_spawn):
+        """_reconcile does NOT re-dispatch nudged agents when nudge.enabled=False."""
+        with tempfile.TemporaryDirectory() as app, tempfile.TemporaryDirectory() as repo_dir:
+            app_dir, repo = Path(app), Path(repo_dir)
+            later = self._setup_repo(repo)
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app_dir)}, clear=False):
+                self._write_config(app_dir, repo, nudge_enabled=False)
+                cfg = core.load_config()
+                state = core.State()
+                task = core.parse_tasks(later.read_text(encoding="utf-8"))[0].tasks[0]
+                agent = self._make_agent(
+                    [task], result_path="/tmp/nonexistent_xyz_neg.json", pid=None, retries=0,
+                )
+                state.repos[str(repo)] = core.RepoState(in_flight=True, agents=[agent])
+
+                core._reconcile(cfg, state, datetime.now(timezone.utc))
+                mock_spawn.assert_not_called()
+                self.assertFalse(state.repos[str(repo)].in_flight)
+
+    @patch.object(core, "_is_process_alive", return_value=False)
+    def test_retries_at_max_does_not_redispatch(self, _):
+        """_reconcile does NOT re-dispatch when retries >= max_retries."""
+        with tempfile.TemporaryDirectory() as app, tempfile.TemporaryDirectory() as repo_dir:
+            app_dir, repo = Path(app), Path(repo_dir)
+            later = self._setup_repo(repo)
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app_dir)}, clear=False):
+                self._write_config(app_dir, repo, nudge_enabled=True, max_retries=2)
+                cfg = core.load_config()
+                state = core.State()
+                task = core.parse_tasks(later.read_text(encoding="utf-8"))[0].tasks[0]
+                agent = self._make_agent(
+                    [task], result_path="/tmp/nonexistent_xyz_neg.json", pid=None, retries=2,
+                )
+                state.repos[str(repo)] = core.RepoState(in_flight=True, agents=[agent])
+
+                completed = core._reconcile(cfg, state, datetime.now(timezone.utc))
+                self.assertEqual(completed, 1)
+                self.assertFalse(state.repos[str(repo)].in_flight)
+                self.assertEqual(len(state.repos[str(repo)].agents), 0)
+
+    @patch.object(core, "_is_process_alive", return_value=False)
+    def test_agent_with_no_entries_handles_gracefully(self, _):
+        """_reconcile with agent that has no entries handles gracefully (empty task list)."""
+        with tempfile.TemporaryDirectory() as app, tempfile.TemporaryDirectory() as repo_dir:
+            app_dir, repo = Path(app), Path(repo_dir)
+            self._setup_repo(repo)
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app_dir)}, clear=False):
+                self._write_config(app_dir, repo, nudge_enabled=False)
+                cfg = core.load_config()
+                state = core.State()
+                # Agent with empty entries list
+                agent = {
+                    "section_name": "",
+                    "pid": None,
+                    "result_path": "/tmp/nonexistent_neg.json",
+                    "entries": [],
+                    "branch": None,
+                    "worktree_path": None,
+                    "dispatch_ts": None,
+                    "retries": 0,
+                }
+                state.repos[str(repo)] = core.RepoState(in_flight=True, agents=[agent])
+
+                # Should not crash
+                completed = core._reconcile(cfg, state, datetime.now(timezone.utc))
+                self.assertEqual(completed, 1)
+                self.assertFalse(state.repos[str(repo)].in_flight)
+
+    @patch.object(core, "_is_process_alive", return_value=False)
+    def test_result_only_failed_markers_nothing_marked_done(self, _):
+        """_reconcile with agent result containing only FAILED markers marks nothing done."""
+        with tempfile.TemporaryDirectory() as app, tempfile.TemporaryDirectory() as repo_dir:
+            app_dir, repo = Path(app), Path(repo_dir)
+            later = self._setup_repo(repo, "- [ ] (P1) task alpha\n- [ ] (P1) task beta\n")
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app_dir)}, clear=False):
+                self._write_config(app_dir, repo)
+                cfg = core.load_config()
+                state = core.State()
+                sections = core.parse_tasks(later.read_text(encoding="utf-8"))
+                t1 = sections[0].tasks[0]
+                t2 = sections[0].tasks[1]
+                result_file = repo / "result.json"
+                result_file.write_text(
+                    f"FAILED (err) {t1.id}: failed alpha\n"
+                    f"FAILED (err) {t2.id}: failed beta\n",
+                    encoding="utf-8",
+                )
+                agent = self._make_agent([t1, t2], result_path=str(result_file), pid=None)
+                state.repos[str(repo)] = core.RepoState(in_flight=True, agents=[agent])
+
+                core._reconcile(cfg, state, datetime.now(timezone.utc))
+                updated = later.read_text(encoding="utf-8")
+                self.assertNotIn("[x]", updated)
+                self.assertIn("- [ ] (P1) task alpha", updated)
+                self.assertIn("- [ ] (P1) task beta", updated)
+
+    @patch.object(core, "_is_process_alive", return_value=False)
+    def test_later_md_deleted_between_dispatch_and_reconcile(self, _):
+        """_reconcile when LATER.md was deleted between dispatch and reconcile does not crash."""
+        with tempfile.TemporaryDirectory() as app, tempfile.TemporaryDirectory() as repo_dir:
+            app_dir, repo = Path(app), Path(repo_dir)
+            later = self._setup_repo(repo)
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app_dir)}, clear=False):
+                self._write_config(app_dir, repo)
+                cfg = core.load_config()
+                state = core.State()
+                task = core.parse_tasks(later.read_text(encoding="utf-8"))[0].tasks[0]
+                result_file = repo / "result.json"
+                result_file.write_text(f"DONE {task.id}: fixed\n", encoding="utf-8")
+                agent = self._make_agent([task], result_path=str(result_file), pid=None)
+                state.repos[str(repo)] = core.RepoState(in_flight=True, agents=[agent])
+
+                # Delete LATER.md before reconcile
+                later.unlink()
+
+                # Should not crash
+                completed = core._reconcile(cfg, state, datetime.now(timezone.utc))
+                self.assertEqual(completed, 1)
+                self.assertFalse(state.repos[str(repo)].in_flight)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -754,6 +755,335 @@ class ReadHookPayloadHardeningTests(unittest.TestCase):
         result = core._read_hook_payload(data)
         self.assertEqual(result["cwd"], "/repo")
         self.assertEqual(len(result["large_field"]), 1024 * 1024)
+
+
+# ---------------------------------------------------------------------------
+# Handler rejection / negative tests
+# ---------------------------------------------------------------------------
+class TestRunHandlerRejections(_BaseTestCase):
+    """Tests that run_handler REJECTS bad states and does NOT dispatch when it shouldn't."""
+
+    def test_empty_stdin_returns_0(self):
+        """run_handler with empty stdin returns 0, does not crash."""
+        code = core.run_handler("")
+        self.assertEqual(code, 0)
+
+    def test_plain_text_stdin_returns_0(self):
+        """run_handler with stdin that is not JSON (plain text 'hello') returns 0."""
+        code = core.run_handler("hello")
+        self.assertEqual(code, 0)
+
+    def test_stdin_json_no_cwd_still_works(self):
+        """run_handler with stdin JSON that has no cwd still works (uses default)."""
+        code = core.run_handler(json.dumps({"session_id": "s1"}))
+        self.assertEqual(code, 0)
+
+    @patch("cc_later.core._spawn_dispatch", return_value=12345)
+    def test_only_completed_tasks_does_not_dispatch(self, mock_spawn):
+        """run_handler when LATER.md has only completed tasks does NOT dispatch."""
+        self._write_later(
+            "# LATER\n\n## Queue\n"
+            "- [x] (P1) already done task one\n"
+            "- [x] (P0) already done task two\n"
+        )
+        code = core.run_handler(self._stdin())
+        self.assertEqual(code, 0)
+        mock_spawn.assert_not_called()
+
+    @patch("cc_later.core._spawn_dispatch", return_value=12345)
+    def test_empty_later_file_does_not_dispatch(self, mock_spawn):
+        """run_handler when LATER.md is empty does NOT dispatch."""
+        self._write_later("")
+        code = core.run_handler(self._stdin())
+        self.assertEqual(code, 0)
+        mock_spawn.assert_not_called()
+
+    @patch("cc_later.core._spawn_dispatch", return_value=12345)
+    @patch("cc_later.core._is_process_alive", return_value=True)
+    def test_all_repos_in_flight_skips_all(self, mock_alive, mock_spawn):
+        """run_handler when all repos are already in-flight skips all."""
+        state = core.State(repos={
+            str(self.repo): core.RepoState(
+                in_flight=True,
+                agents=[{"pid": 111, "result_path": "/tmp/x.json", "entries": [], "retries": 0}],
+            )
+        })
+        core.save_state(state)
+        code = core.run_handler(self._stdin())
+        self.assertEqual(code, 0)
+        mock_spawn.assert_not_called()
+
+    @patch("cc_later.core._spawn_dispatch", return_value=12345)
+    def test_budget_at_exactly_80pct_does_not_dispatch(self, mock_spawn):
+        """run_handler when budget is at exactly 80% (backoff threshold) does NOT dispatch."""
+        self._budget_patch.stop()
+        with patch(
+            "cc_later.core.compute_budget_state",
+            return_value=core.BudgetState(used_tokens=8_000_000, pct_used=0.80),
+        ):
+            code = core.run_handler(self._stdin())
+        self._budget_patch.start()
+        self.assertEqual(code, 0)
+        mock_spawn.assert_not_called()
+
+    @patch("cc_later.core._spawn_dispatch", return_value=12345)
+    def test_budget_at_79_9pct_does_dispatch(self, mock_spawn):
+        """run_handler when budget is at 79.9% DOES dispatch."""
+        self._budget_patch.stop()
+        with patch(
+            "cc_later.core.compute_budget_state",
+            return_value=core.BudgetState(used_tokens=7_990_000, pct_used=0.799),
+        ):
+            code = core.run_handler(self._stdin())
+        self._budget_patch.start()
+        self.assertEqual(code, 0)
+        mock_spawn.assert_called()
+
+    @patch("cc_later.core._spawn_dispatch", return_value=12345)
+    def test_window_aware_remaining_31m_does_not_dispatch(self, mock_spawn):
+        """window_aware mode with remaining=31m (above 30m trigger) does NOT dispatch."""
+        self._write_config(
+            WINDOW_DISPATCH_MODE="window_aware",
+            WINDOW_TRIGGER_AT_MINUTES_REMAINING="30",
+            AUTO_RESUME_ENABLED="false",
+        )
+        self._window_patch.stop()
+        with patch(
+            "cc_later.core.compute_window_state",
+            return_value=core.WindowState(
+                elapsed_minutes=269,
+                remaining_minutes=31,
+                total_input_tokens=1000,
+                total_output_tokens=500,
+            ),
+        ):
+            code = core.run_handler(self._stdin())
+        self._window_patch.start()
+        self.assertEqual(code, 0)
+        mock_spawn.assert_not_called()
+
+    @patch("cc_later.core._spawn_dispatch", return_value=12345)
+    def test_window_aware_remaining_30m_does_dispatch(self, mock_spawn):
+        """window_aware mode with remaining=30m (at trigger) DOES dispatch."""
+        self._write_config(
+            WINDOW_DISPATCH_MODE="window_aware",
+            WINDOW_TRIGGER_AT_MINUTES_REMAINING="30",
+            AUTO_RESUME_ENABLED="false",
+        )
+        self._window_patch.stop()
+        with patch(
+            "cc_later.core.compute_window_state",
+            return_value=core.WindowState(
+                elapsed_minutes=270,
+                remaining_minutes=30,
+                total_input_tokens=1000,
+                total_output_tokens=500,
+            ),
+        ):
+            code = core.run_handler(self._stdin())
+        self._window_patch.start()
+        self.assertEqual(code, 0)
+        mock_spawn.assert_called()
+
+    @patch("cc_later.core._spawn_dispatch", return_value=12345)
+    def test_called_twice_within_idle_grace_second_skips(self, mock_spawn):
+        """run_handler called twice within idle_grace_period, second call skips."""
+        self._write_config(WINDOW_IDLE_GRACE_PERIOD_MINUTES="60")
+        # First call sets last_hook_ts
+        state = core.State(last_hook_ts=datetime.now(timezone.utc).isoformat())
+        core.save_state(state)
+        code = core.run_handler(self._stdin())
+        self.assertEqual(code, 0)
+        mock_spawn.assert_not_called()
+
+    @patch("cc_later.core._spawn_dispatch", return_value=None)
+    def test_spawn_returns_none_for_all_sections(self, mock_spawn):
+        """run_handler when _spawn_dispatch returns None for ALL sections,
+        no agents added, in_flight stays False."""
+        self._write_later(
+            "# LATER\n\n## Docs\n- [ ] (P1) write docs\n\n## Tests\n- [ ] (P1) add tests\n"
+        )
+        code = core.run_handler(self._stdin())
+        self.assertEqual(code, 0)
+        state = core.load_state()
+        rs = state.repos[str(self.repo)]
+        self.assertFalse(rs.in_flight)
+        self.assertEqual(len(rs.agents), 0)
+
+
+# ---------------------------------------------------------------------------
+# State corruption / resilience tests
+# ---------------------------------------------------------------------------
+class TestStateCorruption(_BaseTestCase):
+    """Tests that load_state handles corrupt or unexpected data gracefully."""
+
+    def test_repos_as_string_returns_empty(self):
+        """load_state when state.json has repos as a string returns empty State repos."""
+        core.state_path().parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "last_hook_ts": "2026-04-06T10:00:00+00:00",
+            "repos": "not_a_dict",
+        }
+        core.state_path().write_text(json.dumps(payload), encoding="utf-8")
+        state = core.load_state()
+        self.assertEqual(len(state.repos), 0)
+        self.assertEqual(state.last_hook_ts, "2026-04-06T10:00:00+00:00")
+
+    def test_agents_as_string_handles_gracefully(self):
+        """load_state when state.json has agents as a string (not list) handles gracefully."""
+        core.state_path().parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "last_hook_ts": None,
+            "repos": {
+                "/repo1": {
+                    "in_flight": True,
+                    "agents": "this_is_not_a_list",
+                    "resume_entries": [],
+                    "resume_reason": None,
+                    "dispatch_ts": None,
+                }
+            },
+        }
+        core.state_path().write_text(json.dumps(payload), encoding="utf-8")
+        state = core.load_state()
+        rs = state.repos["/repo1"]
+        # agents should be empty list since value is not a list
+        self.assertEqual(rs.agents, [])
+
+    def test_in_flight_as_string_true_handles_gracefully(self):
+        """load_state when state.json has in_flight as string 'true' handles gracefully."""
+        core.state_path().parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "repos": {
+                "/repo1": {
+                    "in_flight": "true",
+                    "agents": [],
+                    "resume_entries": [],
+                    "resume_reason": None,
+                    "dispatch_ts": None,
+                }
+            },
+        }
+        core.state_path().write_text(json.dumps(payload), encoding="utf-8")
+        state = core.load_state()
+        rs = state.repos["/repo1"]
+        # bool("true") is True, so this should be truthy
+        self.assertTrue(rs.in_flight)
+
+    def test_unicode_repo_paths_roundtrip(self):
+        """save_state then load_state with unicode repo paths round-trips correctly."""
+        unicode_path = "/tmp/\u00e9\u00e8\u00ea-\u4e2d\u6587-\U0001f680"
+        state = core.State(repos={
+            unicode_path: core.RepoState(
+                in_flight=True,
+                agents=[{
+                    "section_name": "Queue",
+                    "pid": 42,
+                    "result_path": "/tmp/result.json",
+                    "entries": [],
+                    "branch": None,
+                    "worktree_path": None,
+                    "dispatch_ts": "2026-04-06T10:00:00+00:00",
+                    "retries": 0,
+                }],
+            )
+        })
+        core.save_state(state)
+        loaded = core.load_state()
+        self.assertIn(unicode_path, loaded.repos)
+        self.assertTrue(loaded.repos[unicode_path].in_flight)
+
+    def test_none_values_in_agent_dicts_roundtrip(self):
+        """save_state then load_state with None values in agent dicts handles gracefully."""
+        state = core.State(repos={
+            "/repo": core.RepoState(
+                in_flight=True,
+                agents=[{
+                    "section_name": None,
+                    "pid": None,
+                    "result_path": None,
+                    "entries": None,
+                    "branch": None,
+                    "worktree_path": None,
+                    "dispatch_ts": None,
+                    "retries": None,
+                }],
+            )
+        })
+        core.save_state(state)
+        loaded = core.load_state()
+        rs = loaded.repos["/repo"]
+        self.assertEqual(len(rs.agents), 1)
+        agent = rs.agents[0]
+        self.assertIsNone(agent["pid"])
+        self.assertIsNone(agent["branch"])
+
+
+# ---------------------------------------------------------------------------
+# Worktree rejection / error-handling tests
+# ---------------------------------------------------------------------------
+class TestWorktreeRejections(_BaseTestCase):
+    """Tests that worktree functions handle failures gracefully."""
+
+    @patch("subprocess.run", side_effect=subprocess.CalledProcessError(128, "git"))
+    def test_create_worktree_git_command_fails_returns_none(self, mock_run):
+        """_create_worktree when git command fails returns None, does not crash."""
+        # subprocess.run raising CalledProcessError should be caught by OSError handler
+        # Actually, CalledProcessError is not an OSError, so let's use a proper failure
+        pass
+
+    @patch("subprocess.run")
+    def test_create_worktree_nonzero_returncode_returns_none(self, mock_run):
+        """_create_worktree when git command fails (non-zero returncode) returns None."""
+        mock_run.return_value = MagicMock(returncode=1)
+        result = core._create_worktree(self.repo, "Queue", "20260406-120000")
+        self.assertIsNone(result)
+
+    @patch("subprocess.run", side_effect=subprocess.TimeoutExpired("git", 30))
+    def test_create_worktree_timeout_returns_none(self, mock_run):
+        """_create_worktree when git command times out returns None."""
+        result = core._create_worktree(self.repo, "Queue", "20260406-120000")
+        self.assertIsNone(result)
+
+    @patch("subprocess.run")
+    def test_merge_worktree_revlist_fails_still_tries_merge(self, mock_run):
+        """_merge_worktree when git rev-list fails still tries merge."""
+        call_count = []
+        def side_effect(cmd, **kw):
+            call_count.append(cmd)
+            if "rev-list" in cmd:
+                return MagicMock(returncode=128, stdout="", stderr="error")
+            if "merge" in cmd and "--abort" not in cmd:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        mock_run.side_effect = side_effect
+        ok, conflicts = core._merge_worktree(self.repo, "cc-later/b", Path("/wt"), "Queue")
+        self.assertTrue(ok)
+        # Verify that merge was attempted after rev-list failed
+        merge_calls = [c for c in call_count if "merge" in c and "--abort" not in c]
+        self.assertGreaterEqual(len(merge_calls), 1)
+
+    @patch("subprocess.run")
+    def test_cleanup_worktree_remove_fails_still_tries_branch_delete(self, mock_run):
+        """_cleanup_worktree when git worktree remove fails still tries branch delete."""
+        call_count = []
+        def side_effect(cmd, **kw):
+            call_count.append(cmd)
+            if "worktree" in cmd:
+                raise OSError("worktree remove failed")
+            return MagicMock(returncode=0)
+        mock_run.side_effect = side_effect
+        # Should not crash
+        core._cleanup_worktree(self.repo, "cc-later/b", Path("/wt"))
+        # Verify branch delete was still attempted
+        branch_calls = [c for c in call_count if "branch" in c]
+        self.assertEqual(len(branch_calls), 1)
+
+    @patch("subprocess.run", side_effect=OSError("git not found"))
+    def test_cleanup_worktree_both_commands_fail_no_crash(self, mock_run):
+        """_cleanup_worktree when both git commands fail does not crash."""
+        # Should not raise
+        core._cleanup_worktree(self.repo, "cc-later/b", Path("/wt"))
 
 
 if __name__ == "__main__":

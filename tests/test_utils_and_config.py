@@ -751,5 +751,104 @@ class TestSafeReadHardening(unittest.TestCase):
             self.assertIsNone(result)
 
 
+class TestLoadConfigRejectsInvalidInput(unittest.TestCase):
+    """Negative tests: load_config must reject bad .env values with ValueError."""
+
+    def _load_with_env(self, content):
+        with tempfile.TemporaryDirectory() as app:
+            cfg_file = Path(app) / "config.env"
+            cfg_file.write_text(content, encoding="utf-8")
+            with patch.dict(os.environ, {core.APP_DIR_ENV: app}, clear=False):
+                return core.load_config()
+
+    def _assert_load_raises(self, content):
+        with self.assertRaises(ValueError):
+            self._load_with_env(content)
+
+    def test_invalid_model_gpt4(self):
+        self._assert_load_raises("DISPATCH_MODEL=gpt4\n")
+
+    def test_invalid_dispatch_mode_never(self):
+        self._assert_load_raises("WINDOW_DISPATCH_MODE=never\n")
+
+    def test_backoff_pct_negative_5(self):
+        self._assert_load_raises("LIMITS_BACKOFF_AT_PCT=-5\n")
+
+    def test_backoff_pct_150(self):
+        self._assert_load_raises("LIMITS_BACKOFF_AT_PCT=150\n")
+
+    def test_weekly_budget_tokens_negative(self):
+        self._assert_load_raises("LIMITS_WEEKLY_BUDGET_TOKENS=-1000\n")
+
+    def test_max_entries_per_dispatch_zero(self):
+        self._assert_load_raises("LATER_MAX_ENTRIES_PER_DISPATCH=0\n")
+
+    def test_max_entries_per_dispatch_negative(self):
+        self._assert_load_raises("LATER_MAX_ENTRIES_PER_DISPATCH=-3\n")
+
+    def test_auto_resume_min_remaining_minutes_negative(self):
+        self._assert_load_raises("AUTO_RESUME_MIN_REMAINING_MINUTES=-10\n")
+
+    def test_later_path_absolute_rejected(self):
+        self._assert_load_raises("LATER_PATH=/etc/passwd\n")
+
+    def test_invalid_plan_premium(self):
+        self._assert_load_raises("PLAN=premium\n")
+
+    def test_nudge_stale_minutes_non_integer(self):
+        with self.assertRaises(ValueError):
+            self._load_with_env("NUDGE_STALE_MINUTES=abc\n")
+
+    def test_window_duration_minutes_non_integer(self):
+        with self.assertRaises(ValueError):
+            self._load_with_env("WINDOW_DURATION_MINUTES=abc\n")
+
+
+class TestParseBoolRejectsGarbage(unittest.TestCase):
+    """Negative tests: _parse_bool with nonsensical values returns False."""
+
+    def test_maybe(self):
+        self.assertFalse(core._parse_bool("maybe"))
+
+    def test_digit_2(self):
+        self.assertFalse(core._parse_bool("2"))
+
+    def test_true1(self):
+        self.assertFalse(core._parse_bool("TRUE1"))
+
+
+class TestParseListOnlyCommas(unittest.TestCase):
+    """Negative tests: _parse_list with only commas returns empty list."""
+
+    def test_only_commas(self):
+        self.assertEqual(core._parse_list(",,,,,"), [])
+
+
+class TestValidateValuesEdgeCases(unittest.TestCase):
+    """Positive edge tests: valid boundary values must NOT raise."""
+
+    def _make_cfg(self, **overrides):
+        cfg = core.Config()
+        for dotted, val in overrides.items():
+            parts = dotted.split(".")
+            obj = cfg
+            for p in parts[:-1]:
+                obj = getattr(obj, p)
+            setattr(obj, parts[-1], val)
+        return cfg
+
+    def test_backoff_0_valid(self):
+        cfg = self._make_cfg(**{"limits.backoff_at_pct": 0})
+        core._validate_values(cfg)  # should not raise
+
+    def test_backoff_100_valid(self):
+        cfg = self._make_cfg(**{"limits.backoff_at_pct": 100})
+        core._validate_values(cfg)  # should not raise
+
+    def test_budget_1_valid(self):
+        cfg = self._make_cfg(**{"limits.weekly_budget_tokens": 1})
+        core._validate_values(cfg)  # should not raise
+
+
 if __name__ == "__main__":
     unittest.main()

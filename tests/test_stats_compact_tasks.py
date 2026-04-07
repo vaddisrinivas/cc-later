@@ -985,5 +985,396 @@ class EnsureLaterFileHardeningTests(unittest.TestCase):
                 os.chmod(str(read_only_dir), 0o755)
 
 
+class ParseTasksNegativeTests(unittest.TestCase):
+    """Negative tests: parse_tasks must reject/filter bad input gracefully."""
+
+    def test_only_headers_no_tasks(self):
+        content = "## Section A\n## Section B\n## Section C\n"
+        sections = core.parse_tasks(content)
+        self.assertEqual(sections, [])
+
+    def test_prose_no_tasks(self):
+        content = "not a task list at all, just prose\nmore prose here\n"
+        sections = core.parse_tasks(content)
+        self.assertEqual(sections, [])
+
+    def test_completed_tasks_filtered_returns_empty(self):
+        content = "- [x] completed task\n- [X] also done\n"
+        sections = core.parse_tasks(content)
+        self.assertEqual(sections, [])
+
+    def test_checkbox_with_empty_text_filtered(self):
+        content = "- [ ] \n"
+        sections = core.parse_tasks(content)
+        self.assertEqual(sections, [])
+
+    def test_checkbox_with_very_short_text(self):
+        # 2-char text "ab" -- parse_tasks filters on `not text` (empty after strip)
+        # but "ab" is non-empty, so it SHOULD be captured
+        content = "- [ ] ab\n"
+        sections = core.parse_tasks(content)
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(sections[0].tasks[0].text, "ab")
+
+
+class ParseResultSummaryNegativeTests(unittest.TestCase):
+    """Negative tests: parse_result_summary with malformed input."""
+
+    def test_done_missing_task_id(self):
+        # "DONE: missing task id" — no ID between status and colon
+        result = core.parse_result_summary("DONE: missing task id\n")
+        self.assertEqual(result, {})
+
+    def test_failed_no_id(self):
+        result = core.parse_result_summary("FAILED: \n")
+        self.assertEqual(result, {})
+
+
+class DetectLimitExhaustionNegativeTests(unittest.TestCase):
+    """Negative tests: partial marker words should NOT match."""
+
+    def test_rate_alone_no_match(self):
+        self.assertIsNone(core.detect_limit_exhaustion("rate"))
+
+    def test_limited_alone_no_match(self):
+        self.assertIsNone(core.detect_limit_exhaustion("limited"))
+
+
+class StableTaskIdNegativeTests(unittest.TestCase):
+    """Negative tests: stable_task_id with edge-case input must not crash."""
+
+    def test_whitespace_only_text(self):
+        tid = core.stable_task_id(0, " ")
+        self.assertTrue(tid.startswith("t_"))
+        self.assertEqual(len(tid), 12)
+
+
+class MarkDoneInContentNegativeTests(unittest.TestCase):
+    """Negative tests: mark_done_in_content with empty done_ids changes nothing."""
+
+    def test_empty_done_ids_no_change(self):
+        content = "- [ ] (P1) task one\n- [ ] (P0) task two\n"
+        result = core.mark_done_in_content(content, set())
+        self.assertEqual(result, content)
+
+
+# ---------------------------------------------------------------------------
+# Capture rejection negative tests
+# ---------------------------------------------------------------------------
+class CaptureFromPayloadNegativeTests(unittest.TestCase):
+    """Negative tests: capture_from_payload must reject bad input gracefully."""
+
+    def setUp(self):
+        self._app_td = tempfile.TemporaryDirectory()
+        self._repo_td = tempfile.TemporaryDirectory()
+        self.app_dir = Path(self._app_td.name)
+        self.repo = Path(self._repo_td.name).resolve()
+        (self.repo / ".git").mkdir()
+        self.env_patch = patch.dict(os.environ, {core.APP_DIR_ENV: str(self.app_dir)}, clear=False)
+        self.env_patch.start()
+        cfg_text = f"PATHS_WATCH={self.repo}\n"
+        (self.app_dir / "config.env").write_text(cfg_text, encoding="utf-8")
+
+    def tearDown(self):
+        self.env_patch.stop()
+        self._app_td.cleanup()
+        self._repo_td.cleanup()
+
+    def _later_path(self):
+        return self.repo / ".claude" / "LATER.md"
+
+    def test_empty_dict_returns_zero_no_crash(self):
+        """capture_from_payload with empty dict returns 0, no crash."""
+        result = core.capture_from_payload({})
+        self.assertEqual(result, 0)
+
+    def test_prompt_none_returns_zero(self):
+        """capture_from_payload with prompt=None returns 0."""
+        result = core.capture_from_payload({"prompt": None})
+        self.assertEqual(result, 0)
+
+    def test_prompt_not_string_returns_zero(self):
+        """capture_from_payload with prompt=123 (not string) returns 0."""
+        result = core.capture_from_payload({"prompt": 123})
+        self.assertEqual(result, 0)
+
+    def test_prompt_empty_string_returns_zero(self):
+        """capture_from_payload with prompt="" (empty string) returns 0."""
+        result = core.capture_from_payload({"prompt": ""})
+        self.assertEqual(result, 0)
+
+    def test_no_later_keyword_adds_zero(self):
+        """capture_from_payload with prompt lacking 'later:' adds 0 tasks."""
+        # Pre-create LATER.md so ensure_later_file template tasks don't confuse us
+        later = self._later_path()
+        later.parent.mkdir(parents=True, exist_ok=True)
+        later.write_text("# LATER\n\n## Queue\n", encoding="utf-8")
+        result = core.capture_from_payload({"prompt": "no later keyword here", "cwd": str(self.repo)})
+        self.assertEqual(result, 0)
+        sections = core.parse_tasks(later.read_text(encoding="utf-8"))
+        total = sum(len(s.tasks) for s in sections)
+        self.assertEqual(total, 0)
+
+    def test_text_too_short_adds_zero(self):
+        """capture_from_payload with prompt='later: ab' (text <3 chars) adds 0 tasks."""
+        # Pre-create LATER.md so ensure_later_file template tasks don't confuse us
+        later = self._later_path()
+        later.parent.mkdir(parents=True, exist_ok=True)
+        later.write_text("# LATER\n\n## Queue\n", encoding="utf-8")
+        result = core.capture_from_payload({"prompt": "later: ab", "cwd": str(self.repo)})
+        self.assertEqual(result, 0)
+        sections = core.parse_tasks(later.read_text(encoding="utf-8"))
+        total = sum(len(s.tasks) for s in sections)
+        self.assertEqual(total, 0)
+
+    def test_duplicate_across_calls_deduplicates(self):
+        """capture_from_payload called twice with same task deduplicates on second call."""
+        payload = {"prompt": "later: fix the bug", "cwd": str(self.repo)}
+        core.capture_from_payload(payload)
+        later = self._later_path()
+        content_after_first = later.read_text(encoding="utf-8")
+        count_first = content_after_first.lower().count("fix the bug")
+
+        core.capture_from_payload(payload)
+        content_after_second = later.read_text(encoding="utf-8")
+        count_second = content_after_second.lower().count("fix the bug")
+        self.assertEqual(count_first, count_second, "Second call should not add duplicate")
+
+    def test_same_task_twice_in_one_prompt_adds_only_one(self):
+        """capture_from_payload with same task twice in one prompt adds only 1."""
+        payload = {"prompt": "later: fix the bug\nlater: fix the bug", "cwd": str(self.repo)}
+        core.capture_from_payload(payload)
+        later = self._later_path()
+        content = later.read_text(encoding="utf-8")
+        count = content.lower().count("fix the bug")
+        self.assertEqual(count, 1)
+
+    def test_urgent_strips_doubled_priority(self):
+        """capture_from_payload with 'later[!]: (P0) urgent fix' strips doubled priority."""
+        payload = {"prompt": "later[!]: (P0) urgent fix", "cwd": str(self.repo)}
+        core.capture_from_payload(payload)
+        later = self._later_path()
+        content = later.read_text(encoding="utf-8")
+        # Should have P0 from the [!] marker, text should be "urgent fix" not "(P0) urgent fix"
+        self.assertIn("(P0) urgent fix", content)
+        self.assertNotIn("(P0) (P0)", content)
+
+    def test_missing_cwd_uses_default_repo(self):
+        """capture_from_payload when cwd is missing from payload uses default repo."""
+        payload = {"prompt": "later: add docs for API"}
+        # Should not crash — resolve_watch_paths falls back to config watch paths
+        result = core.capture_from_payload(payload)
+        self.assertEqual(result, 0)
+
+    def test_later_file_doesnt_exist_creates_it(self):
+        """capture_from_payload when LATER.md doesn't exist yet creates it."""
+        later = self._later_path()
+        self.assertFalse(later.exists())
+        payload = {"prompt": "later: create new feature", "cwd": str(self.repo)}
+        core.capture_from_payload(payload)
+        self.assertTrue(later.exists())
+        content = later.read_text(encoding="utf-8")
+        self.assertIn("create new feature", content)
+
+
+# ---------------------------------------------------------------------------
+# Compact injection negative tests
+# ---------------------------------------------------------------------------
+class CompactInjectNegativeTests(unittest.TestCase):
+    """Negative tests for run_compact_inject edge cases."""
+
+    def _setup_env(self, tmp, compact_enabled=True, later_content=None):
+        app = Path(tmp) / "app"
+        app.mkdir()
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        cfg = f"COMPACT_ENABLED={'true' if compact_enabled else 'false'}\n"
+        (app / "config.env").write_text(cfg, encoding="utf-8")
+        if later_content is not None:
+            later_dir = repo / ".claude"
+            later_dir.mkdir()
+            (later_dir / "LATER.md").write_text(later_content, encoding="utf-8")
+        return app, repo
+
+    def test_compact_disabled_returns_zero_prints_nothing(self):
+        """run_compact_inject when compact.enabled=False returns 0, prints nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app, repo = self._setup_env(tmp, compact_enabled=False)
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app)}, clear=False):
+                with patch("builtins.print") as mock_print:
+                    result = core.run_compact_inject(cwd_hint=str(repo))
+                    self.assertEqual(result, 0)
+                    mock_print.assert_not_called()
+
+    def test_no_repos_have_later_md_outputs_empty(self):
+        """run_compact_inject when no repos have LATER.md outputs 'queue: empty'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app, repo = self._setup_env(tmp, later_content=None)  # no LATER.md
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app)}, clear=False):
+                with patch.object(core, "compute_window_state", return_value=None):
+                    with patch("builtins.print") as mock_print:
+                        core.run_compact_inject(cwd_hint=str(repo))
+                        output = mock_print.call_args[0][0]
+                        self.assertIn("empty", output.lower())
+
+    def test_only_completed_tasks_outputs_empty(self):
+        """run_compact_inject when LATER.md has only completed tasks outputs 'queue: empty'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            later_content = "# LATER\n\n## Queue\n- [x] done task one\n- [X] done task two\n"
+            app, repo = self._setup_env(tmp, later_content=later_content)
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app)}, clear=False):
+                with patch.object(core, "compute_window_state", return_value=None):
+                    with patch("builtins.print") as mock_print:
+                        core.run_compact_inject(cwd_hint=str(repo))
+                        output = mock_print.call_args[0][0]
+                        self.assertIn("empty", output.lower())
+
+    def test_window_state_none_shows_fresh_window(self):
+        """run_compact_inject when window_state is None outputs 'unknown (fresh window)'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            later_content = "# LATER\n\n## Queue\n- [ ] task\n"
+            app, repo = self._setup_env(tmp, later_content=later_content)
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app)}, clear=False):
+                with patch.object(core, "compute_window_state", return_value=None):
+                    with patch("builtins.print") as mock_print:
+                        core.run_compact_inject(cwd_hint=str(repo))
+                        output = mock_print.call_args[0][0]
+                        self.assertIn("unknown (fresh window)", output)
+
+    def test_cwd_hint_nonexistent_dir_handles_gracefully(self):
+        """run_compact_inject with cwd_hint pointing to non-existent dir handles gracefully."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "app"
+            app.mkdir()
+            (app / "config.env").write_text("COMPACT_ENABLED=true\n", encoding="utf-8")
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app)}, clear=False):
+                with patch.object(core, "compute_window_state", return_value=None):
+                    with patch("builtins.print") as mock_print:
+                        # Should not crash even with non-existent cwd_hint
+                        result = core.run_compact_inject(cwd_hint="/tmp/nonexistent_dir_12345")
+                        self.assertEqual(result, 0)
+
+
+# ---------------------------------------------------------------------------
+# Stats negative tests
+# ---------------------------------------------------------------------------
+class StatsNegativeTests(unittest.TestCase):
+    """Negative tests for run_stats edge cases."""
+
+    def _write_jsonl(self, path, rows):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+
+    def _make_row(self, model, input_tokens=0, cache_create=0, cache_read=0, output_tokens=0, session_id=None):
+        row = {
+            "message": {
+                "model": model,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "cache_creation_input_tokens": cache_create,
+                    "cache_read_input_tokens": cache_read,
+                    "output_tokens": output_tokens,
+                },
+            },
+        }
+        if session_id:
+            row["sessionId"] = session_id
+        return row
+
+    def test_days_zero_outputs_zeros_no_crash(self):
+        """run_stats with days=0 outputs zeros, no crash."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(core, "resolve_jsonl_roots", return_value=[root]):
+                with patch("builtins.print") as mock_print:
+                    ret = core.run_stats(days=0)
+                    self.assertEqual(ret, 0)
+                    output = mock_print.call_args[0][0]
+                    self.assertIn("cc-later Stats (0d)", output)
+                    self.assertIn("0", output)
+
+    def test_days_negative_outputs_zeros(self):
+        """run_stats with days=-1 outputs zeros (cutoff is in the future, nothing matches)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fp = root / "test.jsonl"
+            self._write_jsonl(fp, [self._make_row("claude-sonnet-4-6", input_tokens=5000)])
+            with patch.object(core, "resolve_jsonl_roots", return_value=[root]):
+                with patch("builtins.print") as mock_print:
+                    ret = core.run_stats(days=-1)
+                    self.assertEqual(ret, 0)
+                    output = mock_print.call_args[0][0]
+                    # Cutoff is in the future so no files should match
+                    self.assertIn("cc-later Stats", output)
+
+    def test_no_jsonl_files_outputs_zeros(self):
+        """run_stats with no JSONL files outputs zeros, correct formatting."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(core, "resolve_jsonl_roots", return_value=[root]):
+                with patch("builtins.print") as mock_print:
+                    ret = core.run_stats(days=7)
+                    self.assertEqual(ret, 0)
+                    output = mock_print.call_args[0][0]
+                    self.assertIn("cc-later Stats (7d)", output)
+                    self.assertIn("Grand total:", output)
+                    self.assertIn("JSONL files:", output)
+
+    def test_all_unknown_model_uses_default_pricing(self):
+        """run_stats when all rows have model='unknown-model' uses default pricing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fp = root / "test.jsonl"
+            # 1M input at default $3/M = $3.00
+            self._write_jsonl(fp, [self._make_row("unknown-model", input_tokens=1_000_000)])
+            with patch.object(core, "resolve_jsonl_roots", return_value=[root]):
+                with patch("builtins.print") as mock_print:
+                    core.run_stats(days=7)
+                    output = mock_print.call_args[0][0]
+                    self.assertIn("unknown-model", output)
+                    self.assertIn("3.00", output)
+
+    def test_all_zero_usage_model_skipped(self):
+        """run_stats when rows have usage with all zero values: model skipped in output."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fp = root / "test.jsonl"
+            self._write_jsonl(fp, [
+                self._make_row("claude-opus-4-6", input_tokens=0, cache_create=0, cache_read=0, output_tokens=0),
+            ])
+            with patch.object(core, "resolve_jsonl_roots", return_value=[root]):
+                with patch("builtins.print") as mock_print:
+                    core.run_stats(days=7)
+                    output = mock_print.call_args[0][0]
+                    # Model with all-zero usage should be skipped
+                    self.assertNotIn("claude-opus-4-6", output)
+
+    def test_savings_negative_when_sub_cost_exceeds_api_cost(self):
+        """run_stats when savings would be negative (sub cost > api cost) shows negative %."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fp = root / "test.jsonl"
+            # Tiny usage: 100 input tokens at sonnet $3/M = $0.0003
+            # 7d sub cost = 7/30 * 200 = ~$46.67
+            # savings = (1 - 46.67/0.0003) * 100 = massively negative
+            self._write_jsonl(fp, [self._make_row("claude-sonnet-4-6", input_tokens=100)])
+            with patch.object(core, "resolve_jsonl_roots", return_value=[root]):
+                with patch("builtins.print") as mock_print:
+                    core.run_stats(days=7)
+                    output = mock_print.call_args[0][0]
+                    # Should have a Savings line since total_cost > 0
+                    self.assertIn("Savings:", output)
+                    # The savings value should be negative
+                    # Extract the savings percentage
+                    for line in output.split("\n"):
+                        if "Savings:" in line:
+                            # Should contain a negative number
+                            self.assertIn("-", line)
+                            break
+
+
 if __name__ == "__main__":
     unittest.main()
