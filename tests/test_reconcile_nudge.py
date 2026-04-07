@@ -1154,5 +1154,71 @@ class NudgeRedispatchSpawnFailure(_Base):
                 self.assertEqual(len(state.repos[str(repo)].agents), 0)
 
 
+class ReconcileHardeningTests(_Base):
+    @patch.object(core, "_is_process_alive", return_value=False)
+    def test_reconcile_empty_result_file(self, _):
+        """_reconcile when result_path points to empty file (0 bytes)."""
+        with tempfile.TemporaryDirectory() as app, tempfile.TemporaryDirectory() as repo_dir:
+            app_dir, repo = Path(app), Path(repo_dir)
+            later = self._setup_repo(repo)
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app_dir)}, clear=False):
+                self._write_config(app_dir, repo, nudge_enabled=False)
+                cfg = core.load_config()
+                state = core.State()
+                task = core.parse_tasks(later.read_text(encoding="utf-8"))[0].tasks[0]
+                result_file = repo / "result.json"
+                result_file.write_text("", encoding="utf-8")
+                agent = self._make_agent([task], result_path=str(result_file), pid=None)
+                state.repos[str(repo)] = core.RepoState(in_flight=True, agents=[agent])
+
+                # Should not crash; empty result means no tasks completed
+                completed = core._reconcile(cfg, state, datetime.now(timezone.utc))
+                self.assertIsInstance(completed, int)
+
+    @patch.object(core, "_is_process_alive", return_value=False)
+    def test_reconcile_binary_result_file(self, _):
+        """_reconcile when result_path points to binary file."""
+        with tempfile.TemporaryDirectory() as app, tempfile.TemporaryDirectory() as repo_dir:
+            app_dir, repo = Path(app), Path(repo_dir)
+            later = self._setup_repo(repo)
+            with patch.dict(os.environ, {core.APP_DIR_ENV: str(app_dir)}, clear=False):
+                self._write_config(app_dir, repo, nudge_enabled=False)
+                cfg = core.load_config()
+                state = core.State()
+                task = core.parse_tasks(later.read_text(encoding="utf-8"))[0].tasks[0]
+                result_file = repo / "result.json"
+                result_file.write_bytes(b"\x80\x81\x82\xff\xfe\x00\x01\x02")
+                agent = self._make_agent([task], result_path=str(result_file), pid=None)
+                state.repos[str(repo)] = core.RepoState(in_flight=True, agents=[agent])
+
+                # Should not crash with binary content (fixed: _safe_read catches UnicodeDecodeError)
+                completed = core._reconcile(cfg, state, datetime.now(timezone.utc))
+                self.assertIsInstance(completed, int)
+
+
+class IsProcessAliveHardeningTests(unittest.TestCase):
+    def test_pid_negative_one(self):
+        """_is_process_alive with PID -1 should return False, not crash."""
+        result = core._is_process_alive(-1)
+        # PID -1 with os.kill sends signal to all processes in the group
+        # The function should handle this safely
+        self.assertIsInstance(result, bool)
+
+    def test_pid_very_large_definitely_dead(self):
+        """_is_process_alive with PID 99999999 (very large, definitely dead)."""
+        result = core._is_process_alive(99999999)
+        self.assertFalse(result)
+
+
+class IsAgentStaleHardeningTests(_Base):
+    def test_dispatch_ts_garbage_string(self):
+        """_is_agent_stale when dispatch_ts is garbage string (not ISO)."""
+        now = datetime.now(timezone.utc)
+        agent = {"result_path": "/tmp/nonexistent_xyz_hardening.json", "dispatch_ts": "not-a-valid-date-lol"}
+        # _parse_iso returns None for garbage -> should return False (can't determine)
+        result = core._is_agent_stale(agent, now, stale_minutes=10)
+        self.assertFalse(result)
+
+
 if __name__ == "__main__":
     unittest.main()

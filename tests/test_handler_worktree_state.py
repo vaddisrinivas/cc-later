@@ -690,5 +690,71 @@ class TestEnsureGitignoreEdgeCases(_BaseTestCase):
         self.assertEqual(count, 1)
 
 
+class SaveStateHardeningTests(_BaseTestCase):
+    def test_very_large_state(self):
+        """save_state with very large state (100 repos, 10 agents each) should not crash."""
+        repos = {}
+        for i in range(100):
+            agents = []
+            for j in range(10):
+                agents.append({
+                    "section_name": f"Section_{j}",
+                    "pid": 10000 + i * 10 + j,
+                    "result_path": f"/tmp/result_{i}_{j}.json",
+                    "entries": [{"id": f"t_{i}_{j}", "text": f"task {i}-{j}", "priority": "P1", "line_index": j}],
+                    "branch": f"cc-later/S{j}-{i}",
+                    "worktree_path": f"/tmp/wt_{i}_{j}",
+                    "dispatch_ts": "2026-04-06T10:00:00+00:00",
+                    "retries": 0,
+                })
+            repos[f"/repo_{i}"] = core.RepoState(in_flight=True, agents=agents)
+        state = core.State(repos=repos)
+        core.save_state(state)
+        loaded = core.load_state()
+        self.assertEqual(len(loaded.repos), 100)
+        for key in repos:
+            self.assertEqual(len(loaded.repos[key].agents), 10)
+
+
+class LoadStateHardeningTests(_BaseTestCase):
+    def test_wrong_structure_repos_is_list(self):
+        """load_state when state.json has repos as a list not dict."""
+        core.state_path().parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "last_hook_ts": "2026-04-06T10:00:00+00:00",
+            "repos": [{"name": "repo1"}],  # list instead of dict
+        }
+        core.state_path().write_text(json.dumps(payload), encoding="utf-8")
+        state = core.load_state()
+        # repos should be empty since the code checks isinstance(raw_repos, dict)
+        self.assertEqual(len(state.repos), 0)
+        self.assertEqual(state.last_hook_ts, "2026-04-06T10:00:00+00:00")
+
+
+class LogEventHardeningTests(_BaseTestCase):
+    def test_log_event_when_run_log_dir_does_not_exist(self):
+        """log_event when run_log directory doesn't exist should create it."""
+        import shutil
+        # Remove the app dir entirely
+        shutil.rmtree(str(self.app_dir), ignore_errors=True)
+        # log_event should create the directory and write the event
+        core.log_event("test_hardening_event")
+        self.assertTrue(core.run_log_path().exists())
+        lines = core.run_log_path().read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lines), 1)
+        entry = json.loads(lines[0])
+        self.assertEqual(entry["event"], "test_hardening_event")
+
+
+class ReadHookPayloadHardeningTests(unittest.TestCase):
+    def test_extremely_large_json_1mb(self):
+        """_read_hook_payload with extremely large JSON (1MB) should handle it."""
+        large_value = "x" * (1024 * 1024)
+        data = json.dumps({"cwd": "/repo", "large_field": large_value})
+        result = core._read_hook_payload(data)
+        self.assertEqual(result["cwd"], "/repo")
+        self.assertEqual(len(result["large_field"]), 1024 * 1024)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -188,16 +188,29 @@ def _flock(name: str):
 
     Prevents concurrent hooks (e.g. two Claude sessions) from corrupting
     shared resources like state.json or running simultaneous git merges.
+    Falls through without locking on NFS or unsupported filesystems.
     """
     lock_path = app_dir() / f".{name}.lock"
     app_dir().mkdir(parents=True, exist_ok=True)
-    fd = lock_path.open("w")
+    fd = None
+    locked = False
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        fd = lock_path.open("w")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+        except OSError:
+            # flock not supported (NFS, etc.) — proceed without lock
+            pass
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        fd.close()
+        if fd is not None:
+            if locked:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            fd.close()
 
 
 def run_log_path() -> Path:
@@ -208,17 +221,41 @@ def default_config_template_path() -> Path:
     return Path(__file__).resolve().parent.parent / "scripts" / "default_config.env"
 
 
+def _rotate_log_if_needed(log_path: Path, max_bytes: int = 1_000_000) -> None:
+    """Rotate run_log.jsonl when it exceeds max_bytes (~1MB)."""
+    try:
+        if log_path.exists() and log_path.stat().st_size > max_bytes:
+            rotated = log_path.with_suffix(".jsonl.1")
+            log_path.replace(rotated)
+    except OSError:
+        pass
+
+
 def log_event(event: str, **fields: Any) -> None:
-    app_dir().mkdir(parents=True, exist_ok=True)
-    payload = {"ts": datetime.now(timezone.utc).isoformat(), "event": event}
-    payload.update(fields)
-    with run_log_path().open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload, sort_keys=True) + "\n")
+    try:
+        app_dir().mkdir(parents=True, exist_ok=True)
+        log_path = run_log_path()
+        _rotate_log_if_needed(log_path)
+        payload = {"ts": datetime.now(timezone.utc).isoformat(), "event": event}
+        payload.update(fields)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+_MAX_CONFIG_BYTES = 64 * 1024  # 64KB — config files should be tiny
 
 
 def _read_env(path: Path) -> dict[str, str]:
     result: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return result
+    if len(raw) > _MAX_CONFIG_BYTES:
+        raw = raw[:_MAX_CONFIG_BYTES]
+    for line in raw.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -306,10 +343,15 @@ def _coerce_str(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
+_MAX_SAFE_INT = 2**53  # JSON safe integer range
+
+
 def _coerce_int(value: Any) -> int | None:
     if isinstance(value, int):
-        return value
+        return value if abs(value) <= _MAX_SAFE_INT else None
     if isinstance(value, float):
+        if abs(value) > _MAX_SAFE_INT or value != value:  # NaN check
+            return None
         return int(value)
     return None
 
@@ -377,7 +419,7 @@ def save_state(state: State) -> None:
 def _safe_read(path: Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
 
 
@@ -408,31 +450,42 @@ def resolve_watch_paths(cfg: Config, cwd_hint: str | None = None) -> list[Path]:
     return [p]
 
 
+def _atomic_write(path: Path, data: str) -> None:
+    """Write data to path atomically via a temp file + rename."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    tmp.replace(path)
+
+
 def ensure_later_file(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         return
-    path.write_text(
+    _atomic_write(
+        path,
         "# LATER\n\n"
         "Use this format:\n"
         "- [ ] (P1) concise actionable task\n"
         "- [ ] (P0) urgent production/security task\n"
         "- [x] completed task\n\n"
         "## Queue\n",
-        encoding="utf-8",
     )
 
 
-def stable_task_id(line_index: int, text: str) -> str:
+def stable_task_id(line_index: int, text: str | None) -> str:
+    text = text or ""
     digest = hashlib.sha1(f"{line_index}:{text}".encode("utf-8")).hexdigest()[:10]
     return f"t_{digest}"
+
+
+_MAX_LATER_LINES = 10_000
 
 
 def parse_tasks(content: str) -> list[Section]:
     sections: list[Section] = []
     current_name = ""
     current_tasks: list[Task] = []
-    for idx, line in enumerate(content.splitlines()):
+    for idx, line in enumerate(content.splitlines()[:_MAX_LATER_LINES]):
         header = re.match(r"^##\s+(.+)", line)
         if header:
             if current_tasks:
@@ -494,6 +547,9 @@ def detect_limit_exhaustion(raw: str) -> str | None:
     return "limit_exhausted" if any(marker in raw.lower() for marker in LIMIT_MARKERS) else None
 
 
+_MAX_JSONL_LINE_BYTES = 10 * 1024 * 1024  # 10MB — skip corrupt/oversized lines
+
+
 def _iter_jsonl(path: Path) -> list[dict[str, Any]]:
     try:
         lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -503,6 +559,8 @@ def _iter_jsonl(path: Path) -> list[dict[str, Any]]:
     for line in lines:
         line = line.strip()
         if not line:
+            continue
+        if len(line) > _MAX_JSONL_LINE_BYTES:
             continue
         try:
             row = json.loads(line)
@@ -554,24 +612,40 @@ def _jsonl_files(root: Path, recursive: bool = False) -> list[Path]:
     pulling in subagent logs that skew window/budget calculations.
     Use recursive=True when you genuinely need all files (e.g. budget totals).
     """
-    if not root.exists():
+    try:
+        if not root.exists():
+            return []
+        if root.is_file():
+            return [root]
+    except OSError:
         return []
-    if root.is_file():
-        return [root]
     # Top-level: only direct children of each project directory
-    if recursive:
-        return list(root.rglob("*.jsonl"))
-    results: list[Path] = []
-    for project_dir in root.iterdir():
-        if project_dir.is_dir():
-            results.extend(project_dir.glob("*.jsonl"))
-        elif project_dir.suffix == ".jsonl":
-            results.append(project_dir)
-    return results
+    try:
+        if recursive:
+            return list(root.rglob("*.jsonl"))
+        results: list[Path] = []
+        for project_dir in root.iterdir():
+            try:
+                if project_dir.is_dir():
+                    results.extend(project_dir.glob("*.jsonl"))
+                elif project_dir.suffix == ".jsonl":
+                    results.append(project_dir)
+            except OSError:
+                continue
+        return results
+    except OSError:
+        return []
 
 
 
 def compute_window_state(roots: list[Path], now_utc: datetime, session_id: str | None = None, session_gap_minutes: int = 30, window_duration: int = DEFAULT_WINDOW_MINUTES, window_start_hint: datetime | None = None) -> WindowState | None:
+    try:
+        return _compute_window_state_inner(roots, now_utc, session_id, session_gap_minutes, window_duration, window_start_hint)
+    except Exception:
+        return None
+
+
+def _compute_window_state_inner(roots: list[Path], now_utc: datetime, session_id: str | None = None, session_gap_minutes: int = 30, window_duration: int = DEFAULT_WINDOW_MINUTES, window_start_hint: datetime | None = None) -> WindowState | None:
     cutoff = now_utc - timedelta(hours=5)
     future_cutoff = now_utc + timedelta(minutes=5)
 
@@ -659,6 +733,13 @@ def compute_window_state(roots: list[Path], now_utc: datetime, session_id: str |
 
 
 def compute_budget_state(roots: list[Path], now_utc: datetime, weekly_budget: int) -> BudgetState:
+    try:
+        return _compute_budget_state_inner(roots, now_utc, weekly_budget)
+    except Exception:
+        return BudgetState(used_tokens=0, pct_used=0.0)
+
+
+def _compute_budget_state_inner(roots: list[Path], now_utc: datetime, weekly_budget: int) -> BudgetState:
     cutoff = now_utc - timedelta(days=7)
     used = 0
     for root in roots:
@@ -793,8 +874,15 @@ def _auto_resume_gate_open(cfg: Config, watch_paths: list[Path], state: State, w
 def _result_path(template: str, repo: Path, now_utc: datetime, section_slug: str = "") -> Path:
     name = f"{repo.name}-{section_slug}" if section_slug else repo.name
     # Expand both ~ and shell variables like $HOME / ${HOME} in the template.
-    expanded = os.path.expandvars(template.format(repo=name, date=now_utc.strftime("%Y%m%d-%H%M%S")))
-    return Path(expanded).expanduser().resolve()
+    try:
+        expanded = os.path.expandvars(template.format(repo=name, date=now_utc.strftime("%Y%m%d-%H%M%S")))
+        return Path(expanded).expanduser().resolve()
+    except (OSError, ValueError, KeyError):
+        # Fallback to a safe default path if template expansion fails
+        return app_dir() / "results" / f"{name}-{now_utc.strftime('%Y%m%d-%H%M%S')}.json"
+
+
+_MAX_PROMPT_BYTES = 500_000  # 500KB
 
 
 def _render_prompt(repo: Path, tasks: list[Task], allow_file_writes: bool, section_name: str = "") -> str:
@@ -817,7 +905,10 @@ def _render_prompt(repo: Path, tasks: list[Task], allow_file_writes: bool, secti
             "- Do not modify files. Report findings/fixes only." if not allow_file_writes else "- You may edit files directly.",
         ]
     )
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if len(result.encode("utf-8")) > _MAX_PROMPT_BYTES:
+        result = result[:_MAX_PROMPT_BYTES]
+    return result
 
 
 def _worktrees_dir() -> Path:
@@ -835,10 +926,11 @@ def _create_worktree(repo: Path, section_slug: str, timestamp: str) -> tuple[Pat
             cwd=str(repo),
             capture_output=True,
             text=True,
+            timeout=30,
         )
         if result.returncode != 0:
             return None
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
     return worktree_path, branch
 
@@ -859,12 +951,13 @@ def _merge_worktree(repo: Path, branch: str, worktree_path: Path, section_name: 
                 cwd=str(repo),
                 capture_output=True,
                 text=True,
+                timeout=30,
             )
             if diff.returncode == 0 and diff.stdout.strip() == "0":
                 # No commits — agent made no changes, nothing to merge
                 _cleanup_worktree(repo, branch, worktree_path)
                 return True, []
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             pass
 
         try:
@@ -873,6 +966,7 @@ def _merge_worktree(repo: Path, branch: str, worktree_path: Path, section_name: 
                 cwd=str(repo),
                 capture_output=True,
                 text=True,
+                timeout=30,
             )
             if result.returncode == 0:
                 _cleanup_worktree(repo, branch, worktree_path)
@@ -883,12 +977,13 @@ def _merge_worktree(repo: Path, branch: str, worktree_path: Path, section_name: 
                 cwd=str(repo),
                 capture_output=True,
                 text=True,
+                timeout=30,
             )
             conflicting = [f.strip() for f in conflict_result.stdout.splitlines() if f.strip()]
             # Abort the failed merge so the repo is not left in a broken state
-            subprocess.run(["git", "merge", "--abort"], cwd=str(repo), capture_output=True)
+            subprocess.run(["git", "merge", "--abort"], cwd=str(repo), capture_output=True, timeout=30)
             return False, conflicting
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             return False, []
 
 
@@ -899,16 +994,18 @@ def _cleanup_worktree(repo: Path, branch: str, worktree_path: Path) -> None:
             ["git", "worktree", "remove", "--force", str(worktree_path)],
             cwd=str(repo),
             capture_output=True,
+            timeout=30,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         pass
     try:
         subprocess.run(
             ["git", "branch", "-d", branch],
             cwd=str(repo),
             capture_output=True,
+            timeout=30,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         pass
 
 
@@ -947,8 +1044,9 @@ def _kill_agent(pid: int | None) -> None:
     if pid is None or pid <= 0:
         return
     try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
+        sig = getattr(signal, "SIGTERM", 15)
+        os.kill(pid, sig)
+    except (OSError, AttributeError):
         pass
 
 
@@ -1039,7 +1137,7 @@ def _reconcile(cfg: Config, state: State, now_utc: datetime) -> int:
                 if content is not None:
                     updated = mark_done_in_content(content, done_ids)
                     if updated != content:
-                        later_path.write_text(updated, encoding="utf-8")
+                        _atomic_write(later_path, updated)
             completed += 1
 
         # Re-dispatch nudged agents
@@ -1586,7 +1684,7 @@ def capture_from_payload(payload: dict[str, Any]) -> int:
         added += 1
 
     if added:
-        later_file.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        _atomic_write(later_file, "\n".join(lines).rstrip() + "\n")
         log_event("capture", repo=str(repo), added=added)
         print(f"[cc-later] added {added} task(s) to {later_file}")
     return 0

@@ -638,5 +638,118 @@ class TestLoadConfigEdgeCases(unittest.TestCase):
                 self.assertEqual(cfg.nudge.stale_minutes, -5)
 
 
+class TestIterJsonlHardening(unittest.TestCase):
+    def test_corrupt_binary_file(self):
+        """_iter_jsonl with binary garbage should return empty list, not crash."""
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+            f.write(b"\x80\x81\x82\xff\xfe\x00\x01\x02\x03\x04")
+            f.flush()
+            result = core._iter_jsonl(Path(f.name))
+            self.assertEqual(result, [])
+            os.unlink(f.name)
+
+    def test_valid_json_list_not_dict_skipped(self):
+        """_iter_jsonl with a line that is valid JSON but a list, not a dict."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            f.write('[1, 2, 3]\n')
+            f.write('{"valid": "dict"}\n')
+            f.write('"just a string"\n')
+            f.flush()
+            result = core._iter_jsonl(Path(f.name))
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0], {"valid": "dict"})
+            os.unlink(f.name)
+
+    def test_extremely_long_line_no_oom(self):
+        """_iter_jsonl with a 1MB+ line should not OOM and should handle gracefully."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            # Write a valid JSON dict with a very long value
+            long_value = "x" * (1024 * 1024)  # 1MB string
+            f.write('{"key": "' + long_value + '"}\n')
+            f.write('{"normal": "row"}\n')
+            f.flush()
+            result = core._iter_jsonl(Path(f.name))
+            self.assertEqual(len(result), 2)
+            self.assertEqual(result[1], {"normal": "row"})
+            os.unlink(f.name)
+
+
+class TestReadEnvHardening(unittest.TestCase):
+    def test_zero_byte_file(self):
+        """_read_env with a 0-byte file should return empty dict."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("")
+            f.flush()
+            result = core._read_env(Path(f.name))
+            self.assertEqual(result, {})
+            os.unlink(f.name)
+
+    def test_binary_content(self):
+        """_read_env with binary content should return empty dict, not crash."""
+        with tempfile.NamedTemporaryFile(suffix=".env", delete=False) as f:
+            f.write(b"\x80\x81\x82\xff\xfe\x00")
+            f.flush()
+            result = core._read_env(Path(f.name))
+            self.assertEqual(result, {})
+            os.unlink(f.name)
+
+
+class TestParseIsoHardening(unittest.TestCase):
+    def test_epoch_timestamp(self):
+        """_parse_iso with epoch '1970-01-01T00:00:00Z' should parse correctly."""
+        dt = core._parse_iso("1970-01-01T00:00:00Z")
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.year, 1970)
+        self.assertEqual(dt.month, 1)
+        self.assertEqual(dt.day, 1)
+
+    def test_far_future_timestamp(self):
+        """_parse_iso with far-future '2099-12-31T23:59:59Z' should parse correctly."""
+        dt = core._parse_iso("2099-12-31T23:59:59Z")
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.year, 2099)
+        self.assertEqual(dt.month, 12)
+        self.assertEqual(dt.day, 31)
+
+
+class TestLoadConfigHardening(unittest.TestCase):
+    def test_empty_config_file(self):
+        """load_config when config file is empty (0 bytes) should use defaults."""
+        with tempfile.TemporaryDirectory() as app:
+            cfg_file = Path(app) / "config.env"
+            cfg_file.write_text("", encoding="utf-8")
+            with patch.dict(os.environ, {core.APP_DIR_ENV: app}, clear=False):
+                cfg = core.load_config()
+                # Should get all defaults
+                self.assertTrue(cfg.dispatch.enabled)
+                self.assertEqual(cfg.dispatch.model, "sonnet")
+                self.assertEqual(cfg.window.dispatch_mode, "window_aware")
+
+    def test_config_file_only_comments(self):
+        """load_config when config file has only comments should use defaults."""
+        with tempfile.TemporaryDirectory() as app:
+            cfg_file = Path(app) / "config.env"
+            cfg_file.write_text(
+                "# This is a comment\n"
+                "# Another comment\n"
+                "# DISPATCH_ENABLED=false\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {core.APP_DIR_ENV: app}, clear=False):
+                cfg = core.load_config()
+                self.assertTrue(cfg.dispatch.enabled)
+                self.assertEqual(cfg.dispatch.model, "sonnet")
+
+
+class TestSafeReadHardening(unittest.TestCase):
+    def test_symlink_to_missing_target(self):
+        """_safe_read when file is a symlink to a missing target should return None."""
+        with tempfile.TemporaryDirectory() as d:
+            link_path = Path(d) / "broken_link.txt"
+            link_path.symlink_to(Path(d) / "nonexistent_target.txt")
+            result = core._safe_read(link_path)
+            self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()

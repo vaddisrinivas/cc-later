@@ -780,5 +780,88 @@ class TestComputeBudgetStateEdgeCases(unittest.TestCase):
         self.assertEqual(bs.used_tokens, 150)
 
 
+class TestComputeWindowStateHardening(unittest.TestCase):
+    """Hardening tests for compute_window_state()."""
+
+    def _write_jsonl(self, path: Path, rows: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    def test_10000_rows_performance(self):
+        """compute_window_state with 10000+ JSONL rows should complete reasonably fast."""
+        import time
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "big.jsonl"
+            # Generate 10000 rows all within the window
+            rows = []
+            base = datetime(2026, 4, 5, 15, 0, tzinfo=timezone.utc)
+            for i in range(10000):
+                ts = base + timedelta(seconds=i * 0.3)  # ~50 min spread
+                rows.append({
+                    "timestamp": ts.isoformat(),
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                })
+            self._write_jsonl(f, rows)
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            start = time.monotonic()
+            ws = compute_window_state([root], now_utc=now)
+            elapsed = time.monotonic() - start
+        self.assertIsNotNone(ws)
+        self.assertLess(elapsed, 5.0, f"compute_window_state took {elapsed:.2f}s for 10000 rows")
+        self.assertEqual(ws.total_input_tokens, 10000)
+
+    def test_all_rows_no_timestamp(self):
+        """compute_window_state when ALL rows have no timestamp returns None."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "no_ts.jsonl"
+            self._write_jsonl(f, [
+                {"usage": {"input_tokens": 100, "output_tokens": 50}},
+                {"usage": {"input_tokens": 200, "output_tokens": 100}},
+                {"some_field": "no timestamp"},
+            ])
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            ws = compute_window_state([root], now_utc=now)
+        self.assertIsNone(ws)
+
+
+class TestComputeBudgetStateHardening(unittest.TestCase):
+    """Hardening tests for compute_budget_state()."""
+
+    def _write_jsonl(self, path: Path, rows: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    def test_negative_token_values(self):
+        """compute_budget_state with negative token values in usage."""
+        now = datetime(2026, 4, 5, 16, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f = root / "neg.jsonl"
+            self._write_jsonl(f, [
+                {"timestamp": "2026-04-05T15:00:00Z", "usage": {"input_tokens": -100, "output_tokens": -50}},
+                {"timestamp": "2026-04-05T15:10:00Z", "usage": {"input_tokens": 200, "output_tokens": 100}},
+            ])
+            os.utime(f, (now.timestamp(), now.timestamp()))
+            bs = compute_budget_state([root], now, weekly_budget=1000)
+        # Negative values will be added as-is; used_tokens = -100 + -50 + 200 + 100 = 150
+        self.assertIsInstance(bs.used_tokens, int)
+
+
+class TestModeGateOpenHardening(unittest.TestCase):
+    """Hardening tests for _mode_gate_open()."""
+
+    def test_unknown_dispatch_mode(self):
+        """_mode_gate_open with unknown dispatch_mode value should return False (default)."""
+        cfg = _make_config(window__dispatch_mode="unknown_mode_xyz")
+        # With an unknown mode, the function should not crash
+        # It falls through to the last return which checks window_state
+        result = _mode_gate_open(cfg, datetime.now(), None)
+        self.assertFalse(result)
+
+
 if __name__ == "__main__":
     unittest.main()

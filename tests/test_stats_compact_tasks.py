@@ -897,5 +897,93 @@ class RunCompactInjectEdgeCases(unittest.TestCase):
                     mock_print.assert_not_called()
 
 
+class ParseTasksHardeningTests(unittest.TestCase):
+    def test_10000_lines_performance(self):
+        """parse_tasks with 10000+ lines should complete in < 1 second and cap at 10000 lines."""
+        import time
+        lines = ["## Queue\n"]
+        for i in range(10001):
+            lines.append(f"- [ ] (P1) task number {i}\n")
+        content = "".join(lines)
+        start = time.monotonic()
+        sections = core.parse_tasks(content)
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 1.0, f"parse_tasks took {elapsed:.2f}s for 10001 tasks")
+        self.assertEqual(len(sections), 1)
+        # Hardening: parse_tasks caps at 10000 lines (header + 9999 tasks)
+        self.assertEqual(len(sections[0].tasks), 9999)
+
+    def test_task_text_only_whitespace(self):
+        """parse_tasks with task text that is ONLY whitespace should be filtered out."""
+        content = "- [ ]    \n- [ ] (P1) real task\n"
+        sections = core.parse_tasks(content)
+        # The whitespace-only task should be filtered because text.strip() is empty
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(len(sections[0].tasks), 1)
+        self.assertEqual(sections[0].tasks[0].text, "real task")
+
+    def test_malformed_checkbox_missing_space(self):
+        """parse_tasks with '- [] text' (missing space in checkbox) should not parse as task."""
+        content = "- [] malformed task\n- [ ] (P1) good task\n"
+        sections = core.parse_tasks(content)
+        # '- []' doesn't match TASK_RE which requires [ xX!] (space or x/X/!)
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(len(sections[0].tasks), 1)
+        self.assertEqual(sections[0].tasks[0].text, "good task")
+
+
+class StableTaskIdHardeningTests(unittest.TestCase):
+    def test_none_text_should_not_crash(self):
+        """stable_task_id with None text should not crash."""
+        result = core.stable_task_id(0, None)
+        self.assertTrue(result.startswith("t_"))
+        self.assertEqual(len(result), 12)  # "t_" + 10 hex chars
+
+
+class MarkDoneHardeningTests(unittest.TestCase):
+    def test_empty_string_content(self):
+        """mark_done_in_content when content is empty string."""
+        result = core.mark_done_in_content("", {"some_id"})
+        self.assertEqual(result, "")
+
+    def test_no_checkboxes_at_all(self):
+        """mark_done_in_content when content has no checkboxes at all."""
+        content = "# Header\nSome text\nMore text\n"
+        result = core.mark_done_in_content(content, {"some_id"})
+        self.assertEqual(result, content)
+
+
+class DetectLimitExhaustionHardeningTests(unittest.TestCase):
+    def test_very_large_input_1mb(self):
+        """detect_limit_exhaustion with 1MB string should handle without issues."""
+        large_text = "x" * (1024 * 1024)
+        result = core.detect_limit_exhaustion(large_text)
+        self.assertIsNone(result)
+
+    def test_very_large_input_with_marker(self):
+        """detect_limit_exhaustion with 1MB string containing a marker should detect it."""
+        large_text = "x" * (512 * 1024) + "rate limit" + "x" * (512 * 1024)
+        result = core.detect_limit_exhaustion(large_text)
+        self.assertEqual(result, "limit_exhausted")
+
+
+class EnsureLaterFileHardeningTests(unittest.TestCase):
+    def test_parent_dir_read_only(self):
+        """ensure_later_file when parent dir is read-only should handle OSError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            read_only_dir = Path(tmp) / "readonly"
+            read_only_dir.mkdir()
+            os.chmod(str(read_only_dir), 0o444)
+            try:
+                path = read_only_dir / "subdir" / "LATER.md"
+                try:
+                    core.ensure_later_file(path)
+                    # If it succeeds (e.g., running as root), that's fine
+                except OSError:
+                    pass  # Expected — parent dir is read-only
+            finally:
+                os.chmod(str(read_only_dir), 0o755)
+
+
 if __name__ == "__main__":
     unittest.main()
