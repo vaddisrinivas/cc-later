@@ -1,5 +1,5 @@
 ---
-name: later
+name: cc-later
 description: Queue out-of-scope follow-up work in .claude/LATER.md using a strict, dispatchable format. Parallel agents execute tasks near window end.
 ---
 

@@ -89,6 +89,16 @@ On first run, `~/.cc-later/config.env` is created from the bundled template. Dep
 | **Capture** | `later: fix the auth bug` in any prompt auto-appends to LATER.md. |
 | **Stats** | Per-model token analytics with API-equivalent cost breakdown. |
 
+### Plugin surface area
+
+| Type | Count | Details |
+|---|---|---|
+| **Skills** | 1 | `cc-later` — guides Claude on writing LATER.md entries (format, sections, priorities) |
+| **Commands** | 1 | `/cc-later:status` — window, gates, queue, recent runs dashboard |
+| **Hooks** | 3 | Stop (dispatch), UserPromptSubmit (capture), SessionStart (compact inject) |
+| **Scripts** | 5 | handler, capture, compact, status, stats |
+| **Config options** | 23 | Plan, paths, dispatch, window, limits, auto-resume, compact, nudge |
+
 ---
 
 ## LATER.md format
@@ -440,7 +450,7 @@ scripts/
 
 hooks/hooks.json                <-- Hook definitions (all use uv run --project)
 commands/status.md
-skills/later/SKILL.md
+skills/cc-later/SKILL.md
 .claude-plugin/plugin.json
 .claude-plugin/marketplace.json
 pyproject.toml                  <-- uv project config + dependencies
