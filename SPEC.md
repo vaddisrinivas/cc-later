@@ -6,7 +6,20 @@ Internal architecture and component contracts for contributors.
 
 ## Architecture overview
 
-All logic lives in `cc_later/core.py`. Entry-point scripts (`handler.py`, `capture.py`, `compact.py`, `status.py`, `stats.py`) each add the plugin root to `sys.path` and call one function in `core`. No external Python dependencies -- pure stdlib, Python 3.10+.
+All logic lives in `cc_later/core.py`. Entry-point scripts (`handler.py`, `capture.py`, `compact.py`, `status.py`, `stats.py`) each add the plugin root to `sys.path` and call one function in `core`. Managed as a [uv](https://docs.astral.sh/uv/) project (Python 3.10+).
+
+### Dependencies
+
+| Package | Purpose |
+|---|---|
+| **pydantic** (>=2.0) | Config models with declarative validation (`Literal`, `Field(gt=0)`, `@field_validator`). Replaces manual `_validate_values()`. |
+| **pydantic-settings** (>=2.0) | Env file loading support for config. |
+| **filelock** (>=3.0) | Cross-platform advisory file locking. Replaces `fcntl.flock()` (Unix-only). Works on macOS, Linux, Windows, NFS. |
+| **pendulum** (>=3.0) | Timezone-aware datetime parsing. Replaces `datetime.fromisoformat()` with better tz handling. |
+
+### Hook invocation
+
+All hooks use `uv run --project ${CLAUDE_PLUGIN_ROOT}` to auto-resolve dependencies before executing. On first run, uv creates a cached venv; subsequent invocations are near-instant.
 
 ```
 Claude Code (hook system)
@@ -390,18 +403,20 @@ File: `~/.cc-later/config.env` (or `$CC_LATER_APP_DIR/config.env`). Created from
 
 Format: `KEY=VALUE` per line. `#`-prefixed lines and lines without `=` are ignored. Values are not quoted.
 
-Type coercions:
+Type coercions (applied during `load_config()` before Pydantic construction):
 - `bool`: `true`, `1`, `yes` -> `True`; anything else -> `False`
 - `list`: comma-split, stripped, empty entries removed
-- `int`: Python `int()`
+- `int`: `_safe_int()` with graceful fallback to default on malformed input
 
-Post-load validation (`_validate_values`):
-- `dispatch_mode` in `{window_aware, time_based, always}`
-- `dispatch.model` in `{sonnet, opus, haiku}`
-- `limits.weekly_budget_tokens > 0`
-- `0 <= limits.backoff_at_pct <= 100`
-- `auto_resume.min_remaining_minutes >= 0`
-- `later.max_entries_per_dispatch > 0`
+Validation (Pydantic model constraints, enforced at construction time):
+- `dispatch_mode`: `Literal["window_aware", "time_based", "always"]`
+- `dispatch.model`: `Literal["sonnet", "opus", "haiku"]`
+- `limits.weekly_budget_tokens`: `Field(gt=0)`
+- `limits.backoff_at_pct`: `Field(ge=0, le=100)`
+- `auto_resume.min_remaining_minutes`: `Field(ge=0)`
+- `later.max_entries_per_dispatch`: `Field(gt=0)`
+- `later.path`: `@field_validator` rejects absolute paths
+- `plan`: `@field_validator` checks against `PLAN_WINDOW_MINUTES` keys
 
 ### Plan-based window duration
 

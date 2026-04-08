@@ -2,20 +2,19 @@
 
 A Claude Code plugin that dispatches queued follow-up tasks as parallel background agents. Tasks accumulate in `.claude/LATER.md` during a session. Near the end of each usage window, cc-later spawns one `claude -p` agent per `## Section` — each in its own git worktree to prevent conflicts. Failed tasks auto-resume in the next fresh window. Stuck agents are detected and restarted.
 
-No external Python dependencies. Pure stdlib, Python 3.10+.
+Python 3.10+ with [uv](https://docs.astral.sh/uv/) for dependency management. Deps are resolved automatically on first hook run.
 
 ---
 
 ## Table of Contents
 
-- [Modules](#modules)
 - [Install](#install)
 - [Quick start](#quick-start)
+- [What it does](#what-it-does)
 - [LATER.md format](#latermd-format)
 - [Capture shortcut](#capture-shortcut)
 - [Dispatch modes](#dispatch-modes)
 - [Parallel agents and worktrees](#parallel-agents-and-worktrees)
-- [Self-calibrating window detection](#self-calibrating-window-detection)
 - [Auto-resume](#auto-resume)
 - [Nudge (stuck agent detection)](#nudge-stuck-agent-detection)
 - [Context recovery (compact)](#context-recovery-compact)
@@ -27,29 +26,24 @@ No external Python dependencies. Pure stdlib, Python 3.10+.
 
 ---
 
-## Modules
-
-| Module | What it does |
-|---|---|
-| **later** | Section-based parallel dispatch at window end. Each `## Section` in LATER.md gets its own agent. Git worktree isolation when `DISPATCH_ALLOW_FILE_WRITES=true`. |
-| **compact** | Context recovery after `/compact` or auto-compaction. SessionStart hook injects LATER.md queue + window state into Claude's context. |
-| **resume** | Auto-resume tasks that failed due to rate/usage limits in the next fresh window. |
-| **budget** | Global weekly token budget enforcement with backoff gate. |
-| **window** | 5-hour window lifecycle awareness. Self-calibrating window start detection (tracks limit exhaustion, window reset, auto-calibrates). Plan-based defaults (`PLAN=free/pro/max/team/enterprise`). |
-| **stats** | Per-model token analytics with API-equivalent cost breakdown. `python3 scripts/stats.py [7 30 60]` for multi-range reports. |
-| **nudge** | Detects stuck agents (no output for `NUDGE_STALE_MINUTES`) and kills + re-dispatches them. Detects dead agents (crashed) and re-queues them. Max retries configurable. |
-| **hooks** | Stop (handler), UserPromptSubmit (capture), SessionStart/compact (context injection). |
-
----
-
 ## Install
+
+### Prerequisites
+
+- [uv](https://docs.astral.sh/uv/) (dependency manager — `curl -LsSf https://astral.sh/uv/install.sh | sh`)
+
+### Plugin install
 
 ```bash
 claude plugin marketplace add vaddisrinivas/cc-later
 claude plugin install cc-later
 ```
 
-On first run, `~/.cc-later/config.env` is created from the bundled template. Edit it to set your plan and preferences.
+On first run, `~/.cc-later/config.env` is created from the bundled template. Dependencies (pydantic, filelock, pendulum) are resolved automatically by uv on the first hook invocation — no manual `pip install` needed.
+
+### Companion plugin
+
+[cc-retrospect](https://github.com/vaddisrinivas/cc-retrospect) — real-time cost monitoring, waste interception, and token analytics for Claude Code. Complements cc-later: retrospect monitors _what work costs now_, later handles _what work to do later_.
 
 ---
 
@@ -77,7 +71,23 @@ On first run, `~/.cc-later/config.env` is created from the bundled template. Edi
    ```
 5. Near window end, cc-later dispatches one agent per section in parallel.
 6. Check status anytime: `/cc-later:status`
-7. View token analytics: `python3 scripts/stats.py`
+7. View token analytics: `uv run scripts/stats.py`
+
+---
+
+## What it does
+
+| Capability | How it works |
+|---|---|
+| **Parallel dispatch** | Each `## Section` in LATER.md gets its own `claude -p` agent. All sections run simultaneously. |
+| **Worktree isolation** | When `DISPATCH_ALLOW_FILE_WRITES=true`, each agent gets its own git worktree + branch. Merged back on completion. |
+| **Window awareness** | Self-calibrating detection of the 5-hour usage window. Dispatches near window end to use otherwise-idle capacity. |
+| **Auto-resume** | Tasks that fail due to rate limits are re-queued and dispatched in the next fresh window. |
+| **Nudge** | Detects stuck agents (no output for N minutes) and restarts them. Detects crashed agents and re-queues. |
+| **Budget gate** | Rolling 7-day token budget with configurable backoff threshold. |
+| **Context recovery** | After `/compact`, re-injects LATER.md queue + window state into Claude's context. |
+| **Capture** | `later: fix the auth bug` in any prompt auto-appends to LATER.md. |
+| **Stats** | Per-model token analytics with API-equivalent cost breakdown. |
 
 ---
 
@@ -268,9 +278,9 @@ This ensures Claude retains awareness of the task queue after context compaction
 ## Token analytics (stats)
 
 ```bash
-python3 scripts/stats.py              # default: 7d and 30d
-python3 scripts/stats.py 60           # custom single range
-python3 scripts/stats.py 7 30 90      # multiple ranges
+uv run scripts/stats.py              # default: 7d and 30d
+uv run scripts/stats.py 60           # custom single range
+uv run scripts/stats.py 7 30 90      # multiple ranges
 ```
 
 Output includes per-model breakdowns (input, cache creation, cache read, output tokens), API-equivalent cost at current pricing, session count, and a comparison against Max plan subscription cost.
@@ -418,45 +428,60 @@ Plugin source:
 ```
 cc_later/
   __init__.py
-  core.py                       <-- all logic: config, state, parsing, dispatch,
-                                     worktrees, window, budget, nudge, stats, compact
+  core.py                       <-- all logic (pydantic models, filelock, pendulum)
 
 scripts/
-  handler.py                    <-- Stop hook entry point -> core.run_handler()
+  handler.py                    <-- Stop hook -> core.run_handler()
   capture.py                    <-- UserPromptSubmit hook -> core.capture_from_payload()
   compact.py                    <-- SessionStart/compact hook -> core.run_compact_inject()
   status.py                     <-- /cc-later:status -> core.run_status()
   stats.py                      <-- Token analytics -> core.run_stats()
   default_config.env            <-- config template (copied on first run)
 
-hooks/hooks.json                <-- Stop, UserPromptSubmit, SessionStart hooks
+hooks/hooks.json                <-- Hook definitions (all use uv run --project)
 commands/status.md
 skills/later/SKILL.md
 .claude-plugin/plugin.json
 .claude-plugin/marketplace.json
+pyproject.toml                  <-- uv project config + dependencies
+uv.lock                        <-- lockfile
 ```
 
 ---
 
 ## Development and testing
 
-No external packages required.
+Requires [uv](https://docs.astral.sh/uv/).
 
 ```bash
-# Run all tests
-python3 -m pytest tests/ -v
+# Install deps (including test group)
+uv sync --group test
+
+# Run all 513 tests
+uv run pytest tests/ -v
 
 # Smoke-test the handler without spawning real agents
-echo '{}' | python3 scripts/handler.py
+echo '{}' | uv run scripts/handler.py
 
 # Check status
-python3 scripts/status.py
+uv run scripts/status.py
 
 # Token analytics (7d and 30d)
-python3 scripts/stats.py
+uv run scripts/stats.py
 ```
 
-Test files:
+### Dependencies
+
+| Package | Purpose |
+|---|---|
+| [pydantic](https://docs.pydantic.dev/) | Config models with declarative validation (`Literal`, `Field(gt=0)`) |
+| [pydantic-settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/) | Env file loading support |
+| [filelock](https://py-filelock.readthedocs.io/) | Cross-platform file locking (macOS, Linux, Windows, NFS) |
+| [pendulum](https://pendulum.eustace.io/) | Timezone-aware datetime parsing and arithmetic |
+
+### Test suite
+
+513 tests across 10 modules:
 
 | File | What it tests |
 |---|---|
@@ -468,22 +493,5 @@ Test files:
 | `test_window_budget.py` | JSONL window calculation, stale row filtering, weekly budget |
 | `test_window_gates_budget.py` | Window gate logic, budget gate, dispatch mode gates |
 | `test_stats_compact_tasks.py` | Stats output, compact injection, task parsing edge cases |
-| `test_utils_and_config.py` | Config validation, utility functions, plan defaults |
+| `test_utils_and_config.py` | Pydantic validation, utility functions, plan defaults |
 | `test_plugin_layout.py` | Plugin manifest validity, hook config, command presence |
-
-To test dispatch without spawning real agents:
-
-```python
-from unittest.mock import patch
-with patch("cc_later.core._spawn_dispatch", return_value=12345):
-    core.run_handler(json.dumps({"cwd": str(repo)}))
-```
-
-To isolate tests from `~/.cc-later`:
-
-```python
-import os
-from unittest.mock import patch
-with patch.dict(os.environ, {"CC_LATER_APP_DIR": "/tmp/test-cc-later"}):
-    cfg = core.load_config()
-```

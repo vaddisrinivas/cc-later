@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cc-later"
+version = "4.2.0"
+description = "Run LATER.md tasks automatically near Claude Code window end"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Srinivas Vaddi" }]
+keywords = ["claude", "claude-code", "task-queue", "automation"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "filelock>=3.0",
+    "pendulum>=3.0",
+]
+
+[dependency-groups]
+test = ["pytest>=7.0", "pytest-cov>=4.0"]
+
+[project.urls]
+Homepage = "https://github.com/vaddisrinivas/cc-later"
+Repository = "https://github.com/vaddisrinivas/cc-later"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cc_later"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

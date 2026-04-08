@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import hashlib
 import json
 import os
@@ -13,7 +11,11 @@ import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+import pendulum
+from filelock import FileLock
+from pydantic import BaseModel, Field, field_validator
 
 APP_DIR_ENV = "CC_LATER_APP_DIR"
 DEFAULT_WINDOW_MINUTES = 300
@@ -46,71 +48,77 @@ CAPTURE_RE = re.compile(
 )
 
 
-@dataclass
-class PathsConfig:
-    watch: list[str] = field(default_factory=list)
+class PathsConfig(BaseModel):
+    watch: list[str] = []
 
 
-@dataclass
-class LaterConfig:
+class LaterConfig(BaseModel):
     path: str = ".claude/LATER.md"
-    max_entries_per_dispatch: int = 3
+    max_entries_per_dispatch: int = Field(default=3, gt=0)
     auto_gitignore: bool = True
 
+    @field_validator("path")
+    @classmethod
+    def _relative_path(cls, v: str) -> str:
+        if os.path.isabs(v):
+            raise ValueError("later.path must be a relative path (joined with repo root), not absolute")
+        return v
 
-@dataclass
-class DispatchConfig:
+
+class DispatchConfig(BaseModel):
     enabled: bool = True
-    model: str = "sonnet"
+    model: Literal["sonnet", "opus", "haiku"] = "sonnet"
     allow_file_writes: bool = False
     output_path: str = "~/.cc-later/results/{repo}-{date}.json"
 
 
-@dataclass
-class WindowConfig:
-    dispatch_mode: str = "window_aware"  # window_aware | time_based | always
-    duration_minutes: int = DEFAULT_WINDOW_MINUTES  # 300 for Max, adjust for Enterprise
+class WindowConfig(BaseModel):
+    dispatch_mode: Literal["window_aware", "time_based", "always"] = "window_aware"
+    duration_minutes: int = Field(default=DEFAULT_WINDOW_MINUTES, gt=0)
     trigger_at_minutes_remaining: int = 30
     idle_grace_period_minutes: int = 10
-    fallback_dispatch_hours: list[str] = field(default_factory=list)
-    jsonl_paths: list[str] = field(default_factory=list)
+    fallback_dispatch_hours: list[str] = []
+    jsonl_paths: list[str] = []
 
 
-@dataclass
-class LimitsConfig:
-    weekly_budget_tokens: int = 10_000_000
-    backoff_at_pct: int = 80
+class LimitsConfig(BaseModel):
+    weekly_budget_tokens: int = Field(default=10_000_000, gt=0)
+    backoff_at_pct: int = Field(default=80, ge=0, le=100)
 
 
-@dataclass
-class AutoResumeConfig:
+class AutoResumeConfig(BaseModel):
     enabled: bool = True
-    min_remaining_minutes: int = 240
+    min_remaining_minutes: int = Field(default=240, ge=0)
 
 
-@dataclass
-class CompactConfig:
+class CompactConfig(BaseModel):
     enabled: bool = True
 
 
-@dataclass
-class NudgeConfig:
+class NudgeConfig(BaseModel):
     enabled: bool = True
     stale_minutes: int = 10
     max_retries: int = 2
 
 
-@dataclass
-class Config:
+class Config(BaseModel):
     plan: str = "max"
-    paths: PathsConfig = field(default_factory=PathsConfig)
-    later: LaterConfig = field(default_factory=LaterConfig)
-    dispatch: DispatchConfig = field(default_factory=DispatchConfig)
-    window: WindowConfig = field(default_factory=WindowConfig)
-    limits: LimitsConfig = field(default_factory=LimitsConfig)
-    auto_resume: AutoResumeConfig = field(default_factory=AutoResumeConfig)
-    compact: CompactConfig = field(default_factory=CompactConfig)
-    nudge: NudgeConfig = field(default_factory=NudgeConfig)
+    paths: PathsConfig = Field(default_factory=PathsConfig)
+    later: LaterConfig = Field(default_factory=LaterConfig)
+    dispatch: DispatchConfig = Field(default_factory=DispatchConfig)
+    window: WindowConfig = Field(default_factory=WindowConfig)
+    limits: LimitsConfig = Field(default_factory=LimitsConfig)
+    auto_resume: AutoResumeConfig = Field(default_factory=AutoResumeConfig)
+    compact: CompactConfig = Field(default_factory=CompactConfig)
+    nudge: NudgeConfig = Field(default_factory=NudgeConfig)
+
+    @field_validator("plan")
+    @classmethod
+    def _valid_plan(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in PLAN_WINDOW_MINUTES:
+            raise ValueError(f"plan must be one of: {', '.join(sorted(PLAN_WINDOW_MINUTES))}")
+        return v
 
 
 @dataclass
@@ -182,35 +190,15 @@ def state_path() -> Path:
     return app_dir() / "state.json"
 
 
-@contextlib.contextmanager
-def _flock(name: str):
+def _flock(name: str) -> FileLock:
     """Process-level advisory lock scoped to app_dir.
 
     Prevents concurrent hooks (e.g. two Claude sessions) from corrupting
     shared resources like state.json or running simultaneous git merges.
-    Falls through without locking on NFS or unsupported filesystems.
+    Cross-platform (works on macOS, Linux, Windows, NFS).
     """
-    lock_path = app_dir() / f".{name}.lock"
     app_dir().mkdir(parents=True, exist_ok=True)
-    fd = None
-    locked = False
-    try:
-        fd = lock_path.open("w")
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            locked = True
-        except OSError:
-            # flock not supported (NFS, etc.) — proceed without lock
-            pass
-        yield
-    finally:
-        if fd is not None:
-            if locked:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-            fd.close()
+    return FileLock(app_dir() / f".{name}.lock", timeout=10)
 
 
 def run_log_path() -> Path:
@@ -236,7 +224,7 @@ def log_event(event: str, **fields: Any) -> None:
         app_dir().mkdir(parents=True, exist_ok=True)
         log_path = run_log_path()
         _rotate_log_if_needed(log_path)
-        payload = {"ts": datetime.now(timezone.utc).isoformat(), "event": event}
+        payload = {"ts": pendulum.now("UTC").isoformat(), "event": event}
         payload.update(fields)
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, sort_keys=True) + "\n")
@@ -245,6 +233,9 @@ def log_event(event: str, **fields: Any) -> None:
 
 
 _MAX_CONFIG_BYTES = 64 * 1024  # 64KB — config files should be tiny
+
+# Env var names kept for backward compatibility with existing config.env files.
+_BOOL_TRUTHY = {"true", "1", "yes"}
 
 
 def _read_env(path: Path) -> dict[str, str]:
@@ -267,7 +258,7 @@ def _read_env(path: Path) -> dict[str, str]:
 
 
 def _parse_bool(val: str) -> bool:
-    return val.strip().lower() in {"true", "1", "yes"}
+    return val.strip().lower() in _BOOL_TRUTHY
 
 
 def _parse_list(val: str) -> list[str]:
@@ -277,25 +268,11 @@ def _parse_list(val: str) -> list[str]:
     return [item.strip() for item in val.split(",") if item.strip()]
 
 
-def _validate_values(cfg: Config) -> None:
-    if cfg.window.dispatch_mode not in {"window_aware", "time_based", "always"}:
-        raise ValueError("window.dispatch_mode must be one of: window_aware, time_based, always")
-    if cfg.dispatch.model not in {"sonnet", "opus", "haiku"}:
-        raise ValueError("dispatch.model must be one of: sonnet, opus, haiku")
-    if cfg.limits.weekly_budget_tokens <= 0:
-        raise ValueError("limits.weekly_budget_tokens must be > 0")
-    if not (0 <= cfg.limits.backoff_at_pct <= 100):
-        raise ValueError("limits.backoff_at_pct must be between 0 and 100")
-    if cfg.window.duration_minutes <= 0:
-        raise ValueError("window.duration_minutes must be > 0")
-    if cfg.auto_resume.min_remaining_minutes < 0:
-        raise ValueError("auto_resume.min_remaining_minutes must be >= 0")
-    if cfg.later.max_entries_per_dispatch <= 0:
-        raise ValueError("later.max_entries_per_dispatch must be > 0")
-    if os.path.isabs(cfg.later.path):
-        raise ValueError("later.path must be a relative path (joined with repo root), not absolute")
-    if cfg.plan not in PLAN_WINDOW_MINUTES:
-        raise ValueError(f"plan must be one of: {', '.join(sorted(PLAN_WINDOW_MINUTES))}")
+def _safe_int(val: str, default: int) -> int:
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
 
 
 def load_config() -> Config:
@@ -306,37 +283,51 @@ def load_config() -> Config:
         log_event("config_created", path=str(path))
 
     raw = _read_env(path)
-    cfg = Config()
-    cfg.plan = raw.get("PLAN", cfg.plan).strip().lower()
-    cfg.paths.watch = _parse_list(raw.get("PATHS_WATCH", ""))
-    cfg.later.path = raw.get("LATER_PATH", cfg.later.path)
-    cfg.later.max_entries_per_dispatch = int(raw.get("LATER_MAX_ENTRIES_PER_DISPATCH", cfg.later.max_entries_per_dispatch))
-    cfg.later.auto_gitignore = _parse_bool(raw.get("LATER_AUTO_GITIGNORE", str(cfg.later.auto_gitignore)))
-    cfg.dispatch.enabled = _parse_bool(raw.get("DISPATCH_ENABLED", str(cfg.dispatch.enabled)))
-    cfg.dispatch.model = raw.get("DISPATCH_MODEL", cfg.dispatch.model)
-    cfg.dispatch.allow_file_writes = _parse_bool(raw.get("DISPATCH_ALLOW_FILE_WRITES", str(cfg.dispatch.allow_file_writes)))
-    cfg.dispatch.output_path = raw.get("DISPATCH_OUTPUT_PATH", cfg.dispatch.output_path)
-    cfg.window.dispatch_mode = raw.get("WINDOW_DISPATCH_MODE", cfg.window.dispatch_mode)
+
+    plan = raw.get("PLAN", "max").strip().lower()
     _dur_raw = raw.get("WINDOW_DURATION_MINUTES", "").strip()
     if _dur_raw and _dur_raw.lower() != "auto":
-        cfg.window.duration_minutes = int(_dur_raw)
+        duration = _safe_int(_dur_raw, DEFAULT_WINDOW_MINUTES)
     else:
-        # Use plan-based default
-        cfg.window.duration_minutes = PLAN_WINDOW_MINUTES.get(cfg.plan, DEFAULT_WINDOW_MINUTES)
-    cfg.window.trigger_at_minutes_remaining = int(raw.get("WINDOW_TRIGGER_AT_MINUTES_REMAINING", cfg.window.trigger_at_minutes_remaining))
-    cfg.window.idle_grace_period_minutes = int(raw.get("WINDOW_IDLE_GRACE_PERIOD_MINUTES", cfg.window.idle_grace_period_minutes))
-    cfg.window.fallback_dispatch_hours = _parse_list(raw.get("WINDOW_FALLBACK_DISPATCH_HOURS", ""))
-    cfg.window.jsonl_paths = _parse_list(raw.get("WINDOW_JSONL_PATHS", ""))
-    cfg.limits.weekly_budget_tokens = int(raw.get("LIMITS_WEEKLY_BUDGET_TOKENS", cfg.limits.weekly_budget_tokens))
-    cfg.limits.backoff_at_pct = int(raw.get("LIMITS_BACKOFF_AT_PCT", cfg.limits.backoff_at_pct))
-    cfg.auto_resume.enabled = _parse_bool(raw.get("AUTO_RESUME_ENABLED", str(cfg.auto_resume.enabled)))
-    cfg.auto_resume.min_remaining_minutes = int(raw.get("AUTO_RESUME_MIN_REMAINING_MINUTES", cfg.auto_resume.min_remaining_minutes))
-    cfg.compact.enabled = _parse_bool(raw.get("COMPACT_ENABLED", str(cfg.compact.enabled)))
-    cfg.nudge.enabled = _parse_bool(raw.get("NUDGE_ENABLED", str(cfg.nudge.enabled)))
-    cfg.nudge.stale_minutes = int(raw.get("NUDGE_STALE_MINUTES", cfg.nudge.stale_minutes))
-    cfg.nudge.max_retries = int(raw.get("NUDGE_MAX_RETRIES", cfg.nudge.max_retries))
-    _validate_values(cfg)
-    return cfg
+        duration = PLAN_WINDOW_MINUTES.get(plan, DEFAULT_WINDOW_MINUTES)
+
+    return Config(
+        plan=plan,
+        paths=PathsConfig(watch=_parse_list(raw.get("PATHS_WATCH", ""))),
+        later=LaterConfig(
+            path=raw.get("LATER_PATH", ".claude/LATER.md"),
+            max_entries_per_dispatch=_safe_int(raw.get("LATER_MAX_ENTRIES_PER_DISPATCH", ""), 3),
+            auto_gitignore=_parse_bool(raw.get("LATER_AUTO_GITIGNORE", "true")),
+        ),
+        dispatch=DispatchConfig(
+            enabled=_parse_bool(raw.get("DISPATCH_ENABLED", "true")),
+            model=raw.get("DISPATCH_MODEL", "sonnet"),
+            allow_file_writes=_parse_bool(raw.get("DISPATCH_ALLOW_FILE_WRITES", "false")),
+            output_path=raw.get("DISPATCH_OUTPUT_PATH", "~/.cc-later/results/{repo}-{date}.json"),
+        ),
+        window=WindowConfig(
+            dispatch_mode=raw.get("WINDOW_DISPATCH_MODE", "window_aware"),
+            duration_minutes=duration,
+            trigger_at_minutes_remaining=_safe_int(raw.get("WINDOW_TRIGGER_AT_MINUTES_REMAINING", ""), 30),
+            idle_grace_period_minutes=_safe_int(raw.get("WINDOW_IDLE_GRACE_PERIOD_MINUTES", ""), 10),
+            fallback_dispatch_hours=_parse_list(raw.get("WINDOW_FALLBACK_DISPATCH_HOURS", "")),
+            jsonl_paths=_parse_list(raw.get("WINDOW_JSONL_PATHS", "")),
+        ),
+        limits=LimitsConfig(
+            weekly_budget_tokens=_safe_int(raw.get("LIMITS_WEEKLY_BUDGET_TOKENS", ""), 10_000_000),
+            backoff_at_pct=_safe_int(raw.get("LIMITS_BACKOFF_AT_PCT", ""), 80),
+        ),
+        auto_resume=AutoResumeConfig(
+            enabled=_parse_bool(raw.get("AUTO_RESUME_ENABLED", "true")),
+            min_remaining_minutes=_safe_int(raw.get("AUTO_RESUME_MIN_REMAINING_MINUTES", ""), 240),
+        ),
+        compact=CompactConfig(enabled=_parse_bool(raw.get("COMPACT_ENABLED", "true"))),
+        nudge=NudgeConfig(
+            enabled=_parse_bool(raw.get("NUDGE_ENABLED", "true")),
+            stale_minutes=_safe_int(raw.get("NUDGE_STALE_MINUTES", ""), 10),
+            max_retries=_safe_int(raw.get("NUDGE_MAX_RETRIES", ""), 2),
+        ),
+    )
 
 
 def _coerce_str(value: Any) -> str | None:
@@ -360,12 +351,10 @@ def _parse_iso(raw: Any) -> datetime | None:
     if not isinstance(raw, str) or not raw:
         return None
     try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
+        dt = pendulum.parse(raw, strict=False)
+    except Exception:
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    return dt.in_tz("UTC")
 
 
 def load_state() -> State:
@@ -1214,7 +1203,7 @@ def run_handler(stdin_text: str | None = None) -> int:
         return 0
 
     payload = _read_hook_payload(stdin_text)
-    now_utc = datetime.now(timezone.utc)
+    now_utc = pendulum.now("UTC")
     now_local = now_utc.astimezone()
     state = load_state()
     completed = _reconcile(cfg, state, now_utc)
@@ -1401,7 +1390,7 @@ def run_handler(stdin_text: str | None = None) -> int:
 def build_status(cwd_hint: str | None = None) -> str:
     cfg = load_config()
     state = load_state()
-    now_utc = datetime.now(timezone.utc)
+    now_utc = pendulum.now("UTC")
     now_local = now_utc.astimezone()
     roots = resolve_jsonl_roots(cfg)
     window_start_hint = _parse_iso(state.window_start_ts)
@@ -1493,7 +1482,7 @@ def run_compact_inject(cwd_hint: str | None = None) -> int:
     if not cfg.compact.enabled:
         return 0
 
-    now_utc = datetime.now(timezone.utc)
+    now_utc = pendulum.now("UTC")
     state = load_state()
     roots = resolve_jsonl_roots(cfg)
     window_start_hint = _parse_iso(state.window_start_ts)
@@ -1564,7 +1553,7 @@ def run_stats(days: int = 7) -> int:
     """Print detailed token analytics with per-model cost breakdown."""
     cfg = load_config()
     roots = resolve_jsonl_roots(cfg)
-    now_utc = datetime.now(timezone.utc)
+    now_utc = pendulum.now("UTC")
     cutoff = now_utc - timedelta(days=days)
 
     # Accumulators: model -> {input, cache_create, cache_read, output}

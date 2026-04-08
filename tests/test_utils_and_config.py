@@ -56,67 +56,51 @@ class TestParseList(unittest.TestCase):
 
 
 class TestValidateValues(unittest.TestCase):
-    def _make_cfg(self, **overrides):
-        cfg = core.Config()
-        for dotted, val in overrides.items():
-            parts = dotted.split(".")
-            obj = cfg
-            for p in parts[:-1]:
-                obj = getattr(obj, p)
-            setattr(obj, parts[-1], val)
-        return cfg
+    """Pydantic models validate at construction time.
+
+    Tests confirm that invalid values raise ValidationError (subclass of ValueError).
+    """
 
     def test_valid_defaults_pass(self):
-        cfg = core.Config()
-        core._validate_values(cfg)  # should not raise
+        core.Config()  # should not raise
 
     def test_invalid_dispatch_mode(self):
-        cfg = self._make_cfg(**{"window.dispatch_mode": "invalid"})
         with self.assertRaises(ValueError):
-            core._validate_values(cfg)
+            core.WindowConfig(dispatch_mode="invalid")
 
     def test_invalid_model(self):
-        cfg = self._make_cfg(**{"dispatch.model": "gpt4"})
         with self.assertRaises(ValueError):
-            core._validate_values(cfg)
+            core.DispatchConfig(model="gpt4")
 
     def test_backoff_at_pct_negative(self):
-        cfg = self._make_cfg(**{"limits.backoff_at_pct": -1})
         with self.assertRaises(ValueError):
-            core._validate_values(cfg)
+            core.LimitsConfig(backoff_at_pct=-1)
 
     def test_backoff_at_pct_101(self):
-        cfg = self._make_cfg(**{"limits.backoff_at_pct": 101})
         with self.assertRaises(ValueError):
-            core._validate_values(cfg)
+            core.LimitsConfig(backoff_at_pct=101)
 
     def test_backoff_at_pct_0_is_valid(self):
-        cfg = self._make_cfg(**{"limits.backoff_at_pct": 0})
-        core._validate_values(cfg)  # should not raise
+        core.LimitsConfig(backoff_at_pct=0)  # should not raise
 
     def test_backoff_at_pct_100_is_valid(self):
-        cfg = self._make_cfg(**{"limits.backoff_at_pct": 100})
-        core._validate_values(cfg)  # should not raise
+        core.LimitsConfig(backoff_at_pct=100)  # should not raise
 
     def test_negative_weekly_budget(self):
-        cfg = self._make_cfg(**{"limits.weekly_budget_tokens": -100})
         with self.assertRaises(ValueError):
-            core._validate_values(cfg)
+            core.LimitsConfig(weekly_budget_tokens=-100)
 
     def test_zero_weekly_budget(self):
-        cfg = self._make_cfg(**{"limits.weekly_budget_tokens": 0})
         with self.assertRaises(ValueError):
-            core._validate_values(cfg)
+            core.LimitsConfig(weekly_budget_tokens=0)
 
     def test_negative_min_remaining_minutes(self):
-        cfg = self._make_cfg(**{"auto_resume.min_remaining_minutes": -1})
         with self.assertRaises(ValueError):
-            core._validate_values(cfg)
+            core.AutoResumeConfig(min_remaining_minutes=-1)
 
     def test_zero_max_entries_per_dispatch(self):
-        cfg = self._make_cfg(**{"later.max_entries_per_dispatch": 0})
         with self.assertRaises(ValueError):
-            core._validate_values(cfg)
+            core.LaterConfig(max_entries_per_dispatch=0)
 
 
 class TestCoerceStr(unittest.TestCase):
@@ -165,12 +149,12 @@ class TestParseIso(unittest.TestCase):
         self.assertIsNotNone(dt)
         self.assertEqual(dt.year, 2025)
         self.assertEqual(dt.hour, 10)
-        self.assertEqual(dt.tzinfo, timezone.utc)
+        self.assertEqual(str(dt.tzinfo), "UTC")
 
     def test_z_suffix(self):
         dt = core._parse_iso("2025-01-15T10:30:00Z")
         self.assertIsNotNone(dt)
-        self.assertEqual(dt.tzinfo, timezone.utc)
+        self.assertEqual(str(dt.tzinfo), "UTC")
 
     def test_with_offset(self):
         dt = core._parse_iso("2025-01-15T10:30:00-05:00")
@@ -194,7 +178,7 @@ class TestParseIso(unittest.TestCase):
     def test_naive_datetime_gets_utc(self):
         dt = core._parse_iso("2025-01-15T10:30:00")
         self.assertIsNotNone(dt)
-        self.assertEqual(dt.tzinfo, timezone.utc)
+        self.assertEqual(str(dt.tzinfo), "UTC")
         self.assertEqual(dt.hour, 10)
 
 
@@ -565,7 +549,7 @@ class TestParseIsoEdgeCases(unittest.TestCase):
         """_parse_iso with timezone offset '+05:30' (India, non-whole-hour)."""
         dt = core._parse_iso("2026-04-06T12:00:00+05:30")
         self.assertIsNotNone(dt)
-        self.assertEqual(dt.tzinfo, timezone.utc)
+        self.assertEqual(str(dt.tzinfo), "UTC")
         # 12:00 +05:30 = 06:30 UTC
         self.assertEqual(dt.hour, 6)
         self.assertEqual(dt.minute, 30)
@@ -579,7 +563,7 @@ class TestParseIsoEdgeCases(unittest.TestCase):
             self.assertEqual(dt.year, 2026)
             self.assertEqual(dt.month, 4)
             self.assertEqual(dt.day, 6)
-            self.assertEqual(dt.tzinfo, timezone.utc)
+            self.assertEqual(str(dt.tzinfo), "UTC")
 
 
 class TestReadEnvEdgeCases(unittest.TestCase):
@@ -795,13 +779,13 @@ class TestLoadConfigRejectsInvalidInput(unittest.TestCase):
     def test_invalid_plan_premium(self):
         self._assert_load_raises("PLAN=premium\n")
 
-    def test_nudge_stale_minutes_non_integer(self):
-        with self.assertRaises(ValueError):
-            self._load_with_env("NUDGE_STALE_MINUTES=abc\n")
+    def test_nudge_stale_minutes_non_integer_uses_default(self):
+        cfg = self._load_with_env("NUDGE_STALE_MINUTES=abc\n")
+        self.assertEqual(cfg.nudge.stale_minutes, 10)  # falls back to default
 
-    def test_window_duration_minutes_non_integer(self):
-        with self.assertRaises(ValueError):
-            self._load_with_env("WINDOW_DURATION_MINUTES=abc\n")
+    def test_window_duration_minutes_non_integer_uses_default(self):
+        cfg = self._load_with_env("WINDOW_DURATION_MINUTES=abc\n")
+        self.assertEqual(cfg.window.duration_minutes, core.DEFAULT_WINDOW_MINUTES)
 
 
 class TestParseBoolRejectsGarbage(unittest.TestCase):
@@ -825,29 +809,16 @@ class TestParseListOnlyCommas(unittest.TestCase):
 
 
 class TestValidateValuesEdgeCases(unittest.TestCase):
-    """Positive edge tests: valid boundary values must NOT raise."""
-
-    def _make_cfg(self, **overrides):
-        cfg = core.Config()
-        for dotted, val in overrides.items():
-            parts = dotted.split(".")
-            obj = cfg
-            for p in parts[:-1]:
-                obj = getattr(obj, p)
-            setattr(obj, parts[-1], val)
-        return cfg
+    """Positive edge tests: valid boundary values must NOT raise (Pydantic validates at construction)."""
 
     def test_backoff_0_valid(self):
-        cfg = self._make_cfg(**{"limits.backoff_at_pct": 0})
-        core._validate_values(cfg)  # should not raise
+        core.LimitsConfig(backoff_at_pct=0)  # should not raise
 
     def test_backoff_100_valid(self):
-        cfg = self._make_cfg(**{"limits.backoff_at_pct": 100})
-        core._validate_values(cfg)  # should not raise
+        core.LimitsConfig(backoff_at_pct=100)  # should not raise
 
     def test_budget_1_valid(self):
-        cfg = self._make_cfg(**{"limits.weekly_budget_tokens": 1})
-        core._validate_values(cfg)  # should not raise
+        core.LimitsConfig(weekly_budget_tokens=1)  # should not raise
 
 
 if __name__ == "__main__":
