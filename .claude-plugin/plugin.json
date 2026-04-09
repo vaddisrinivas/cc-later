@@ -5,5 +5,7 @@
   "author": {
     "name": "vaddisrinivas",
     "url": "https://github.com/vaddisrinivas"
-  }
+  },
+  "commands": "./commands/",
+  "skills": "./skills/"
 }

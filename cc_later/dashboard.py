@@ -277,9 +277,27 @@ def generate_dashboard(app_dir: Path | None = None, cwd: Path | None = None) -> 
     return DASHBOARD_HTML.replace("__DATA_JSON__", data_json)
 
 
+def _kill_previous(pid_file: Path) -> None:
+    """Kill a previously running dashboard if its PID file exists."""
+    if not pid_file.exists():
+        return
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+    except (ValueError, ProcessLookupError, PermissionError):
+        pass
+    pid_file.unlink(missing_ok=True)
+
+
 def run_dashboard(cwd: str | None = None) -> int:
-    """Generate dashboard and serve on localhost."""
+    """Generate dashboard and serve on localhost, replacing any previous instance."""
+    from cc_later.core import app_dir as _app_dir
+
     cwd_path = Path(cwd) if cwd else Path.cwd()
+    pid_file = _app_dir() / "dashboard.pid"
+
+    _kill_previous(pid_file)
+
     html_content = generate_dashboard(cwd=cwd_path)
 
     class Handler(SimpleHTTPRequestHandler):
@@ -295,12 +313,17 @@ def run_dashboard(cwd: str | None = None) -> int:
     server = HTTPServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
     url = f"http://127.0.0.1:{port}"
+
+    # Write PID so next invocation can kill this one
+    pid_file.write_text(str(os.getpid()))
+
     print(f"Dashboard: {url} (Ctrl+C to stop)", file=sys.stderr)
 
     threading.Timer(0.5, lambda: webbrowser.open(url)).start()
 
     def _shutdown(sig, frame):
         print("\nDashboard stopped.", file=sys.stderr)
+        pid_file.unlink(missing_ok=True)
         server.shutdown()
         sys.exit(0)
 
@@ -313,4 +336,5 @@ def run_dashboard(cwd: str | None = None) -> int:
         pass
     finally:
         server.server_close()
+        pid_file.unlink(missing_ok=True)
     return 0
