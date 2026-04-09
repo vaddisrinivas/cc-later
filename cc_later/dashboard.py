@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import signal
 import sys
@@ -37,61 +38,124 @@ def _load_json(path: Path) -> dict:
         return {}
 
 
-# result file: first line may be "DONE task_id: msg" or "error: msg" or blank
 _RESULT_RE = re.compile(
     r"^(DONE|SKIPPED|NEEDS_HUMAN|FAILED)(?:\s+\([^)]+\))?\s+([A-Za-z0-9_-]+)\s*:(.*)",
     re.DOTALL,
 )
-# filename: {worktree_id}-{section}-{YYYYMMDD}-{HHMMSS}.json
 _FNAME_RE = re.compile(r"^(.+?)-([^-]+)-(\d{8})-(\d{6})\.json$")
-
 _TASK_RE = re.compile(
     r"^(?:\s*-\s*)\[(?P<mark>[ xX!])\](?:\s*)(?:(?P<prio>\(P[0-2]\))\s*)?(?P<text>.+?)\s*$"
 )
 
 
-def _parse_results(results_dir: Path) -> list[dict]:
-    results = []
-    if not results_dir.exists():
-        return results
-    for f in sorted(results_dir.glob("*.json")):
-        try:
-            content = f.read_text(encoding="utf-8").strip()
-        except OSError:
-            content = ""
+def _parse_result_file(path: Path) -> dict:
+    """Parse a result text file into {status, task_id, message}."""
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        content = ""
 
-        m = _FNAME_RE.match(f.name)
-        section = m.group(2) if m else "unknown"
-        date_s = m.group(3) if m else ""
-        time_s = m.group(4) if m else ""
-        ts = (
-            f"{date_s[:4]}-{date_s[4:6]}-{date_s[6:8]}T{time_s[:2]}:{time_s[2:4]}:{time_s[4:6]}"
-            if date_s and time_s
-            else ""
-        )
+    if not content:
+        return {"status": "EMPTY", "task_id": "", "message": ""}
+    if content.lower().startswith("error:"):
+        return {"status": "FAILED", "task_id": "", "message": content[6:].strip()[:200]}
+    rm = _RESULT_RE.match(content)
+    if rm:
+        return {
+            "status": rm.group(1),
+            "task_id": rm.group(2),
+            "message": rm.group(3).strip()[:200],
+        }
+    return {"status": "UNKNOWN", "task_id": "", "message": content[:200]}
 
-        if not content:
-            status, task_id, message = "EMPTY", "", ""
-        elif content.lower().startswith("error:"):
-            status, task_id, message = "FAILED", "", content[6:].strip()
-        else:
-            rm = _RESULT_RE.match(content)
-            if rm:
-                status, task_id, message = rm.group(1), rm.group(2), rm.group(3).strip()
-            else:
-                status, task_id, message = "UNKNOWN", "", content[:120]
 
-        results.append(
-            {
-                "filename": f.name,
-                "section": section,
-                "ts": ts,
-                "status": status,
-                "task_id": task_id,
-                "message": message[:200],
+def _repo_short(repo: str) -> str:
+    """Extract short project name from full repo path."""
+    return Path(repo).name if repo else "unknown"
+
+
+def _build_dispatches(run_log: list[dict], results_dir: Path) -> list[dict]:
+    """
+    Join dispatch events from run_log with their result files.
+    Returns list sorted by ts descending.
+    """
+    # Build result map: basename -> parsed result
+    result_cache: dict[str, dict] = {}
+    if results_dir.exists():
+        for f in results_dir.glob("*.json"):
+            result_cache[f.name] = _parse_result_file(f)
+
+    dispatches = []
+    for e in run_log:
+        if e.get("event") != "dispatch":
+            continue
+        result_path = e.get("result_path", "")
+        result_fname = Path(result_path).name if result_path else ""
+        result = result_cache.get(result_fname, {"status": "PENDING", "task_id": "", "message": ""})
+
+        # Parse timestamp from filename for display
+        m = _FNAME_RE.match(result_fname)
+        file_ts = ""
+        if m:
+            d, t = m.group(3), m.group(4)
+            file_ts = f"{d[:4]}-{d[4:6]}-{d[6:8]}T{t[:2]}:{t[2:4]}:{t[4:6]}"
+
+        repo = e.get("repo", "")
+        dispatches.append({
+            "repo": repo,
+            "repo_short": _repo_short(repo),
+            "section": e.get("section") or "default",
+            "ts": e.get("ts", file_ts),
+            "entries": e.get("entries", []),
+            "entries_dispatched": e.get("entries_dispatched", 0),
+            "model": e.get("model", ""),
+            "remaining_minutes": e.get("remaining_minutes"),
+            "result_fname": result_fname,
+            "result_status": result["status"],
+            "result_message": result["message"],
+            "auto_resume": e.get("auto_resume", False),
+        })
+
+    dispatches.sort(key=lambda d: d["ts"], reverse=True)
+    return dispatches
+
+
+def _build_projects(dispatches: list[dict]) -> list[dict]:
+    """
+    Summarize per-repo: last dispatch, success rate, recent history.
+    """
+    by_repo: dict[str, dict] = {}
+    for d in dispatches:
+        repo = d["repo"]
+        if repo not in by_repo:
+            by_repo[repo] = {
+                "repo": repo,
+                "repo_short": d["repo_short"],
+                "last_dispatch_ts": d["ts"],
+                "dispatches": [],
             }
-        )
-    return results
+        by_repo[repo]["dispatches"].append(d)
+
+    projects = []
+    for repo, info in by_repo.items():
+        dd = info["dispatches"]
+        total = len(dd)
+        done = sum(1 for d in dd if d["result_status"] == "DONE")
+        failed = sum(1 for d in dd if d["result_status"] in ("FAILED", "UNKNOWN"))
+        rate = round(done / total * 100) if total else 0
+        projects.append({
+            "repo": repo,
+            "repo_short": info["repo_short"],
+            "last_dispatch_ts": info["last_dispatch_ts"],
+            "total_dispatches": total,
+            "success_rate": rate,
+            "done": done,
+            "failed": failed,
+            "recent": dd[:5],  # last 5 dispatches
+        })
+
+    projects.sort(key=lambda p: p["last_dispatch_ts"], reverse=True)
+    return projects
 
 
 def _parse_later_md(path: Path) -> list[dict]:
@@ -108,15 +172,37 @@ def _parse_later_md(path: Path) -> list[dict]:
         m = _TASK_RE.match(line)
         if m:
             mark = m.group("mark")
-            tasks.append(
-                {
-                    "section": current_section,
-                    "priority": m.group("prio") or "(P1)",
-                    "text": m.group("text"),
-                    "done": mark.lower() == "x",
-                }
-            )
+            tasks.append({
+                "section": current_section,
+                "priority": m.group("prio") or "(P1)",
+                "text": m.group("text"),
+                "done": mark.lower() == "x",
+            })
     return tasks
+
+
+def _find_later_md_paths(run_log: list[dict], cwd: Path) -> list[tuple[str, Path]]:
+    """Return (repo_short, later_md_path) for all repos seen in run_log."""
+    repos_seen: list[str] = []
+    seen_set: set[str] = set()
+    for e in run_log:
+        repo = e.get("repo", "")
+        if repo and repo not in seen_set:
+            seen_set.add(repo)
+            repos_seen.append(repo)
+
+    results = []
+    # Always include cwd
+    cwd_later = cwd / ".claude" / "LATER.md"
+    cwd_str = str(cwd)
+    if cwd_str not in seen_set:
+        results.append((_repo_short(cwd_str), cwd_later))
+
+    for repo in repos_seen:
+        p = Path(repo) / ".claude" / "LATER.md"
+        results.append((_repo_short(repo), p))
+
+    return results
 
 
 def generate_dashboard(app_dir: Path | None = None, cwd: Path | None = None) -> str:
@@ -128,20 +214,35 @@ def generate_dashboard(app_dir: Path | None = None, cwd: Path | None = None) -> 
 
     state = _load_json(app_dir / "state.json")
     run_log = _load_jsonl(app_dir / "run_log.jsonl")
-    results = _parse_results(app_dir / "results")
-    later_tasks = _parse_later_md(cwd / ".claude" / "LATER.md")
+    dispatches = _build_dispatches(run_log, app_dir / "results")
+    projects = _build_projects(dispatches)
+
+    # Gather all later.md files across repos
+    later_by_repo: list[dict] = []
+    for repo_short, later_path in _find_later_md_paths(run_log, cwd):
+        tasks = _parse_later_md(later_path)
+        if tasks or later_path.exists():
+            later_by_repo.append({
+                "repo_short": repo_short,
+                "path": str(later_path),
+                "tasks": tasks,
+            })
+
+    # Fallback: just cwd
+    if not later_by_repo:
+        tasks = _parse_later_md(cwd / ".claude" / "LATER.md")
+        later_by_repo = [{"repo_short": _repo_short(str(cwd)), "path": str(cwd / ".claude" / "LATER.md"), "tasks": tasks}]
+
+    all_tasks = [t for r in later_by_repo for t in r["tasks"]]
 
     window_info = None
     try:
         from cc_later.core import load_config, compute_window_state, resolve_jsonl_roots
-
         cfg = load_config()
         now = datetime.now(timezone.utc)
         roots = resolve_jsonl_roots(cfg)
         if roots:
-            ws = compute_window_state(
-                roots, now, window_duration=cfg.window.duration_minutes
-            )
+            ws = compute_window_state(roots, now, window_duration=cfg.window.duration_minutes)
             if ws:
                 window_info = {
                     "elapsed_minutes": ws.elapsed_minutes,
@@ -153,13 +254,23 @@ def generate_dashboard(app_dir: Path | None = None, cwd: Path | None = None) -> 
     except Exception:
         pass
 
+    # Skip reason counts from run_log
+    skip_reasons: dict[str, int] = {}
+    for e in run_log:
+        if e.get("event") == "skip":
+            r = e.get("reason", "unknown")
+            skip_reasons[r] = skip_reasons.get(r, 0) + 1
+
     data = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "state": state,
-        "run_log": run_log[-1000:],
-        "results": results,
-        "later_tasks": later_tasks,
+        "run_log": run_log[-500:],
+        "dispatches": dispatches[:100],
+        "projects": projects,
+        "later_by_repo": later_by_repo,
+        "later_tasks": all_tasks,
         "window": window_info,
+        "skip_reasons": skip_reasons,
     }
 
     data_json = json.dumps(data, default=str)

@@ -23,9 +23,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .header .meta { color: var(--muted); font-size: 13px; }
 
 /* Stats */
-.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 24px; }
-.stat { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; }
-.stat-val { font-size: 26px; font-weight: 700; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 24px; }
+.stat { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+.stat-val { font-size: 24px; font-weight: 700; }
 .stat-lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 4px; }
 
 /* Grid */
@@ -35,69 +35,88 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .card h3 { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 16px; }
 .card.full { grid-column: 1 / -1; }
 
-/* Window */
-.win-row { display: flex; align-items: center; gap: 20px; margin-bottom: 16px; flex-wrap: wrap; }
-.win-time { font-size: 40px; font-weight: 700; letter-spacing: -1px; }
-.win-label { font-size: 13px; color: var(--muted); }
-.win-track { height: 10px; background: var(--border); border-radius: 5px; margin-bottom: 10px; }
-.win-fill { height: 100%; border-radius: 5px; }
-.win-meta { display: flex; gap: 24px; flex-wrap: wrap; }
-.win-item { font-size: 13px; }
-.win-item span { color: var(--muted); }
-
 /* Badges */
-.badge { display: inline-block; font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 4px; }
+.badge { display: inline-block; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 4px; white-space: nowrap; }
 .badge-done { background: var(--green); color: #000; }
 .badge-failed { background: var(--red); color: #fff; }
 .badge-needs_human { background: var(--yellow); color: #000; }
 .badge-skipped { background: var(--dim); color: var(--text); }
 .badge-empty { background: var(--surface2); color: var(--muted); }
 .badge-unknown { background: var(--surface2); color: var(--muted); }
+.badge-pending { background: var(--blue-bg); color: var(--blue); border: 1px solid var(--blue); }
 .badge-p0 { background: var(--red); color: #fff; }
 .badge-p1 { background: var(--yellow); color: #000; }
 .badge-p2 { background: var(--blue); color: #000; }
-.badge-open { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
-.badge-closed { background: var(--red-bg); color: var(--red); border: 1px solid var(--red); }
-.badge-grade-A { background: var(--green-bg); color: var(--green); }
-.badge-grade-B { background: #2a3520; color: #7ee787; }
-.badge-grade-C { background: var(--yellow-bg); color: var(--yellow); }
-.badge-grade-D { background: var(--red-bg); color: var(--red); }
+.badge-open { background: var(--green-bg); color: var(--green); border: 1px solid rgba(63,185,80,.4); }
+.badge-closed { background: var(--red-bg); color: var(--red); border: 1px solid rgba(248,81,73,.4); }
+.badge-grade-A { background: var(--green-bg); color: var(--green); font-size: 13px; padding: 3px 10px; }
+.badge-grade-B { background: #2a3520; color: #7ee787; font-size: 13px; padding: 3px 10px; }
+.badge-grade-C { background: var(--yellow-bg); color: var(--yellow); font-size: 13px; padding: 3px 10px; }
+.badge-grade-D { background: var(--red-bg); color: var(--red); font-size: 13px; padding: 3px 10px; }
 
-/* Queue health bars */
-.qbar-wrap { margin-bottom: 14px; }
-.qbar-label { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px; }
-.qbar { height: 8px; background: var(--border); border-radius: 4px; }
-.qbar-fill { height: 100%; border-radius: 4px; }
+/* Project cards */
+.proj-card { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+.proj-header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; cursor: pointer; user-select: none; }
+.proj-header:hover { background: var(--surface2); }
+.proj-name { font-size: 14px; font-weight: 600; flex: 1; }
+.proj-meta { font-size: 12px; color: var(--muted); }
+.proj-chevron { color: var(--dim); font-size: 12px; transition: transform .2s; }
+.proj-chevron.open { transform: rotate(90deg); }
+.proj-body { display: none; padding: 0 16px 14px; border-top: 1px solid var(--border); }
+.proj-body.open { display: block; }
 
-/* Agent results list */
-.result-list { max-height: 360px; overflow-y: auto; }
-.result-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
-.result-row:last-child { border-bottom: none; }
-.result-section { color: var(--muted); font-size: 11px; min-width: 80px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.result-msg { flex: 1; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.result-ts { color: var(--dim); font-size: 11px; white-space: nowrap; }
+/* Dispatch rows */
+.dispatch-row { padding: 8px 0; border-bottom: 1px solid var(--border); cursor: pointer; }
+.dispatch-row:last-child { border-bottom: none; }
+.dispatch-row:hover .dispatch-summary { color: var(--text); }
+.dispatch-summary { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+.dispatch-ts { color: var(--dim); font-size: 11px; white-space: nowrap; min-width: 110px; }
+.dispatch-section { color: var(--blue); font-size: 12px; min-width: 80px; }
+.dispatch-count { color: var(--muted); font-size: 12px; }
+.dispatch-detail { display: none; margin-top: 8px; padding: 10px 12px; background: var(--surface2); border-radius: 6px; font-size: 12px; }
+.dispatch-detail.open { display: block; }
+.task-pill { display: inline-block; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 2px 8px; margin: 2px; font-size: 11px; color: var(--text); }
+.result-box { margin-top: 8px; padding: 8px 10px; border-radius: 5px; font-size: 12px; }
+.result-box.done { background: var(--green-bg); border-left: 3px solid var(--green); }
+.result-box.failed { background: var(--red-bg); border-left: 3px solid var(--red); }
+.result-box.needs_human { background: var(--yellow-bg); border-left: 3px solid var(--yellow); }
+.result-box.empty { background: var(--surface2); border-left: 3px solid var(--dim); }
+.result-box.pending { background: var(--blue-bg); border-left: 3px solid var(--blue); }
+.result-box.unknown { background: var(--surface2); border-left: 3px solid var(--dim); }
+.result-box.skipped { background: var(--surface2); border-left: 3px solid var(--dim); }
+
+/* Window */
+.win-row { display: flex; align-items: center; gap: 20px; margin-bottom: 14px; flex-wrap: wrap; }
+.win-time { font-size: 38px; font-weight: 700; letter-spacing: -1px; }
+.win-label { font-size: 12px; color: var(--muted); }
+.win-track { height: 8px; background: var(--border); border-radius: 4px; margin-bottom: 10px; }
+.win-fill { height: 100%; border-radius: 4px; }
+.win-meta { display: flex; gap: 20px; flex-wrap: wrap; font-size: 12px; }
+.win-item span { color: var(--muted); }
 
 /* Task list */
-.task-section-header { font-size: 12px; font-weight: 600; color: var(--blue); text-transform: uppercase; letter-spacing: 0.5px; padding: 10px 0 6px; border-top: 1px solid var(--border); margin-top: 6px; }
-.task-section-header:first-child { border-top: none; margin-top: 0; }
-.task-row { display: flex; align-items: baseline; gap: 8px; padding: 5px 0; font-size: 13px; }
-.task-text { flex: 1; }
+.task-section-hdr { font-size: 11px; font-weight: 600; color: var(--blue); text-transform: uppercase; letter-spacing: .5px; padding: 8px 0 4px; border-top: 1px solid var(--border); margin-top: 4px; }
+.task-section-hdr:first-child { border-top: none; margin-top: 0; }
+.task-row { display: flex; align-items: baseline; gap: 8px; padding: 4px 0; font-size: 13px; }
 .task-text.done { text-decoration: line-through; color: var(--muted); }
 
-/* Failure patterns */
-.fail-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
-.fail-row:last-child { border-bottom: none; }
-.fail-reason { flex: 1; color: var(--text); font-size: 12px; }
-.fail-count { font-weight: 700; color: var(--red); min-width: 30px; text-align: right; }
-.fail-bar { width: 80px; height: 6px; background: var(--border); border-radius: 3px; }
-.fail-bar-fill { height: 100%; border-radius: 3px; background: var(--red); }
+/* Queue bars */
+.qbar-wrap { margin-bottom: 12px; }
+.qbar-label { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px; }
+.qbar { height: 7px; background: var(--border); border-radius: 4px; }
+.qbar-fill { height: 100%; border-radius: 4px; }
 
-/* Skip reasons */
-.skip-tag { display: inline-block; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; margin: 3px; font-size: 12px; }
+/* Patterns */
+.skip-tag { display: inline-block; background: var(--surface2); border: 1px solid var(--border); border-radius: 5px; padding: 3px 9px; margin: 3px; font-size: 12px; }
 .skip-cnt { font-weight: 700; margin-left: 4px; color: var(--yellow); }
+.fail-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+.fail-row:last-child { border-bottom: none; }
+.fail-reason { flex: 1; color: var(--muted); }
+.fail-cnt { font-weight: 700; color: var(--red); min-width: 24px; text-align: right; }
 
-.empty { color: var(--dim); font-style: italic; font-size: 13px; padding: 20px; text-align: center; }
+.empty { color: var(--dim); font-style: italic; font-size: 13px; padding: 16px; text-align: center; }
 .footer { text-align: center; color: var(--dim); font-size: 11px; padding: 24px 0; border-top: 1px solid var(--border); margin-top: 24px; }
+.ago { color: var(--muted); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -110,14 +129,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 <div class="stats" id="stats"></div>
 
 <div class="grid">
-  <div class="card"><h3>Queue Health</h3><div id="queue-health"></div></div>
+  <div class="card full"><h3>Projects &amp; Last Fire</h3><div id="projects"></div></div>
   <div class="card"><h3>Window Status</h3><div id="window-status"></div></div>
-  <div class="card"><h3>Agent Results</h3><div style="height:220px;position:relative"><canvas id="results-chart"></canvas></div></div>
-  <div class="card"><h3>Skip &amp; Gate Patterns</h3><div id="skip-patterns"></div></div>
-  <div class="card full"><h3>Dispatch Timeline</h3><div style="height:240px;position:relative"><canvas id="timeline-chart"></canvas></div></div>
-  <div class="card full"><h3>Recent Agent Runs</h3><div class="result-list" id="result-list"></div></div>
+  <div class="card"><h3>Queue Health</h3><div id="queue-health"></div></div>
+  <div class="card"><h3>Agent Results</h3><div style="height:200px;position:relative"><canvas id="results-chart"></canvas></div></div>
+  <div class="card"><h3>Skip &amp; Gate Reasons</h3><div id="skip-patterns"></div></div>
+  <div class="card full"><h3>Dispatch Timeline</h3><div style="height:220px;position:relative"><canvas id="timeline-chart"></canvas></div></div>
   <div class="card"><h3>Failure Patterns</h3><div id="failure-patterns"></div></div>
-  <div class="card"><h3>Task List</h3><div id="task-list"></div></div>
+  <div class="card"><h3>Task List</h3><div id="task-list" style="max-height:420px;overflow-y:auto"></div></div>
 </div>
 
 <div class="footer">cc-later &middot; refresh with <code>/cc-later:dashboard</code> &middot; Ctrl+C to stop server</div>
@@ -130,73 +149,124 @@ Chart.defaults.borderColor = '#21262d';
 Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, sans-serif';
 Chart.defaults.font.size = 11;
 
-// Meta
+// Helpers
+function ago(ts) {
+  if (!ts) return '';
+  const diff = Math.floor((Date.now() - new Date(ts)) / 1000);
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff/60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff/3600)}h ago`;
+  return `${Math.floor(diff/86400)}d ago`;
+}
+function fmt_ts(ts) {
+  return ts ? ts.replace('T',' ').slice(0,16) : '';
+}
+function badge(status) {
+  const s = (status||'unknown').toLowerCase();
+  return `<span class="badge badge-${s}">${status||'?'}</span>`;
+}
+function status_color(status) {
+  const m = {DONE:'var(--green)',FAILED:'var(--red)',NEEDS_HUMAN:'var(--yellow)',SKIPPED:'var(--dim)',PENDING:'var(--blue)',EMPTY:'var(--dim)',UNKNOWN:'var(--dim)'};
+  return m[status] || 'var(--muted)';
+}
+
+// ── Meta ──────────────────────────────────────────────────────────────────────
 document.getElementById('meta').textContent =
-  `${D.generated_at} \u00b7 ${D.results.length} runs \u00b7 ${D.later_tasks.length} tasks`;
+  `${D.generated_at} · ${D.dispatches.length} dispatches · ${D.later_tasks.length} tasks`;
 
-// ── Stats Row ────────────────────────────────────────────────────────────────
+// ── Stats Row ─────────────────────────────────────────────────────────────────
 (function(){
-  const results = D.results;
-  const total = results.length;
-  const done = results.filter(r => r.status === 'DONE').length;
-  const failed = results.filter(r => r.status === 'FAILED' || r.status === 'UNKNOWN').length;
-  const needs = results.filter(r => r.status === 'NEEDS_HUMAN').length;
-  const rate = total > 0 ? Math.round(done / total * 100) : 0;
-
+  const total = D.dispatches.length;
+  const done = D.dispatches.filter(d => d.result_status === 'DONE').length;
+  const failed = D.dispatches.filter(d => ['FAILED','UNKNOWN'].includes(d.result_status)).length;
+  const rate = total > 0 ? Math.round(done/total*100) : 0;
   const pending = D.later_tasks.filter(t => !t.done).length;
   const completed = D.later_tasks.filter(t => t.done).length;
-
-  const dispatches = D.run_log.filter(e => e.event === 'dispatch').length;
-  const skips = D.run_log.filter(e => e.event === 'skip').length;
-
-  // Grade: A=>=90%, B=>=75%, C=>=50%, D=<50%
-  const grade = rate >= 90 ? 'A' : rate >= 75 ? 'B' : rate >= 50 ? 'C' : total === 0 ? '\u2014' : 'D';
+  const grade = rate >= 90 ? 'A' : rate >= 75 ? 'B' : rate >= 50 ? 'C' : total === 0 ? '—' : 'D';
+  const projects = D.projects.length;
+  const skips = Object.values(D.skip_reasons).reduce((a,b)=>a+b, 0);
 
   document.getElementById('stats').innerHTML = [
     {v: pending, l: 'Pending Tasks'},
-    {v: completed, l: 'Completed Tasks'},
-    {v: dispatches, l: 'Total Dispatched'},
-    {v: total > 0 ? rate + '%' : '\u2014', l: 'Success Rate'},
-    {v: failed, l: 'Failed Runs'},
-    {v: needs, l: 'Needs Human'},
-    {v: `<span class="badge badge-grade-${grade}" style="font-size:22px;padding:4px 12px">${grade}</span>`, l: 'Agent Health'},
-  ].map(s => `<div class="stat"><div class="stat-val">${s.v}</div><div class="stat-lbl">${s.l}</div></div>`).join('');
+    {v: completed, l: 'Completed'},
+    {v: total, l: 'Total Dispatches'},
+    {v: total > 0 ? rate+'%' : '—', l: 'Success Rate'},
+    {v: failed, l: 'Failed'},
+    {v: projects, l: 'Projects'},
+    {v: skips, l: 'Gate Skips'},
+    {v: `<span class="badge badge-grade-${grade}">${grade}</span>`, l: 'Agent Health'},
+  ].map(s=>`<div class="stat"><div class="stat-val">${s.v}</div><div class="stat-lbl">${s.l}</div></div>`).join('');
 })();
 
-// ── Queue Health ──────────────────────────────────────────────────────────────
+// ── Projects & Last Fire ──────────────────────────────────────────────────────
 (function(){
-  const tasks = D.later_tasks;
-  const total = tasks.length;
-  if (!total) {
-    document.getElementById('queue-health').innerHTML = '<div class="empty">No tasks in LATER.md</div>';
+  const el = document.getElementById('projects');
+  if (!D.projects.length) {
+    el.innerHTML = '<div class="empty">No dispatches yet — agents will run near window end</div>';
     return;
   }
-  const pending = tasks.filter(t => !t.done);
-  const done = tasks.filter(t => t.done);
 
-  const p0 = pending.filter(t => t.priority === '(P0)').length;
-  const p1 = pending.filter(t => t.priority === '(P1)').length;
-  const p2 = pending.filter(t => t.priority === '(P2)').length;
-  const pUnk = pending.length - p0 - p1 - p2;
+  el.innerHTML = D.projects.map((p, pi) => {
+    const grade = p.success_rate >= 90 ? 'A' : p.success_rate >= 75 ? 'B' : p.success_rate >= 50 ? 'C' : 'D';
+    const lastAgo = ago(p.last_dispatch_ts);
 
-  const bar = (label, count, total, color) => total === 0 ? '' : `
-    <div class="qbar-wrap">
-      <div class="qbar-label"><span>${label}</span><span>${count} / ${total}</span></div>
-      <div class="qbar"><div class="qbar-fill" style="width:${Math.round(count/total*100)}%;background:${color}"></div></div>
+    const dispatchRows = p.recent.map((d, di) => {
+      const resultClass = d.result_status.toLowerCase();
+      const taskPills = (d.entries||[]).map(e => `<span class="task-pill">${e.length > 60 ? e.slice(0,57)+'…' : e}</span>`).join('');
+      const resultMsg = d.result_message ? `<div class="result-box ${resultClass}"><b>${d.result_status}</b>${d.result_message ? ': '+d.result_message : ''}</div>` : `<div class="result-box ${resultClass}"><b>${d.result_status}</b></div>`;
+      const model = d.model ? `<span style="color:var(--purple);font-size:11px">${d.model}</span>` : '';
+      const rem = d.remaining_minutes != null ? `<span style="color:var(--muted);font-size:11px">${d.remaining_minutes}m left in window</span>` : '';
+      const resume = d.auto_resume ? `<span class="badge badge-pending" style="font-size:9px">RESUME</span>` : '';
+
+      return `<div class="dispatch-row" onclick="toggleDetail('d-${pi}-${di}')">
+        <div class="dispatch-summary">
+          ${badge(d.result_status)}
+          <span class="dispatch-section">${d.section || 'default'}</span>
+          <span class="dispatch-count">${d.entries_dispatched || (d.entries||[]).length} task${(d.entries_dispatched||1)===1?'':'s'}</span>
+          ${resume}
+          <span style="flex:1"></span>
+          ${model} ${rem}
+          <span class="dispatch-ts">${fmt_ts(d.ts)} <span class="ago">${ago(d.ts)}</span></span>
+        </div>
+        <div class="dispatch-detail" id="d-${pi}-${di}">
+          <div style="margin-bottom:6px;color:var(--muted)">${taskPills || '<em>no task list recorded</em>'}</div>
+          ${resultMsg}
+        </div>
+      </div>`;
+    }).join('');
+
+    return `<div class="proj-card">
+      <div class="proj-header" onclick="toggleProj('proj-${pi}')">
+        <span class="proj-chevron" id="chev-${pi}">▶</span>
+        <span class="proj-name">${p.repo_short}</span>
+        <span class="badge badge-grade-${grade}">${grade}</span>
+        <span class="proj-meta">${p.done}/${p.total_dispatches} done &nbsp;·&nbsp; last fired <b>${lastAgo}</b></span>
+        <span class="proj-meta" style="color:var(--dim);font-size:11px">${p.repo}</span>
+      </div>
+      <div class="proj-body" id="proj-${pi}">
+        <div style="padding-top:10px">${dispatchRows}</div>
+      </div>
     </div>`;
+  }).join('');
 
-  document.getElementById('queue-health').innerHTML =
-    bar('Pending', pending.length, total, 'var(--blue)') +
-    bar('Completed', done.length, total, 'var(--green)') +
-    '<div style="border-top:1px solid var(--border);margin:12px 0 10px"></div>' +
-    '<div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">Priority Distribution (pending)</div>' +
-    (pending.length ? (
-      bar('P0 Critical', p0, pending.length, 'var(--red)') +
-      bar('P1 Normal', p1, pending.length, 'var(--yellow)') +
-      bar('P2 Low', p2, pending.length, 'var(--blue)') +
-      (pUnk ? bar('Untagged', pUnk, pending.length, 'var(--dim)') : '')
-    ) : '<div class="empty" style="padding:8px">All done!</div>');
+  // Auto-expand first project
+  if (D.projects.length) {
+    document.getElementById('proj-0').classList.add('open');
+    document.getElementById('chev-0').classList.add('open');
+  }
 })();
+
+function toggleProj(id) {
+  const body = document.getElementById(id);
+  const idx = id.split('-')[1];
+  const chev = document.getElementById('chev-' + idx);
+  body.classList.toggle('open');
+  chev.classList.toggle('open');
+}
+
+function toggleDetail(id) {
+  document.getElementById(id).classList.toggle('open');
+}
 
 // ── Window Status ─────────────────────────────────────────────────────────────
 (function(){
@@ -205,107 +275,97 @@ document.getElementById('meta').textContent =
   const state = D.state;
 
   if (!w) {
-    // Show last hook time + window_limit if known
-    const lim = state.window_limit_ts;
     const last = state.last_hook_ts;
+    const lim = state.window_limit_ts;
     el.innerHTML = `
-      <div style="color:var(--muted);font-size:13px;margin-bottom:12px">Window data unavailable — no JSONL paths configured</div>
-      ${last ? `<div class="win-item"><span>Last hook: </span>${last.replace('T',' ').slice(0,19)} UTC</div>` : ''}
-      ${lim ? `<div class="win-item" style="margin-top:6px;color:var(--red)"><span>Window limit hit: </span>${lim.replace('T',' ').slice(0,19)} UTC</div>` : ''}
+      <div style="color:var(--muted);font-size:13px;margin-bottom:10px">No window data — JSONL paths not configured</div>
+      ${last ? `<div style="font-size:12px"><span style="color:var(--muted)">Last hook: </span>${fmt_ts(last)} UTC <span class="ago">${ago(last)}</span></div>` : ''}
+      ${lim ? `<div style="font-size:12px;color:var(--red);margin-top:6px"><span style="color:var(--muted)">Limit hit: </span>${fmt_ts(lim)} UTC</div>` : ''}
     `;
     return;
   }
 
-  const remaining = w.remaining_minutes;
-  const elapsed = w.elapsed_minutes;
-  const duration = w.duration_minutes || 300;
-  const pct = Math.min(100, Math.round(elapsed / duration * 100));
-  const isLow = remaining <= w.trigger_at;
-  const color = remaining <= 15 ? 'var(--red)' : remaining <= w.trigger_at ? 'var(--yellow)' : 'var(--green)';
-
-  // Gate: open if remaining > trigger_at, closed otherwise
-  const gateOpen = remaining > w.trigger_at;
-  const gateLabel = gateOpen ? 'GATE OPEN' : (remaining <= 0 ? 'WINDOW ENDED' : 'GATE CLOSED \u2014 DISPATCHING');
-
+  const rem = w.remaining_minutes, el2 = w.elapsed_minutes, dur = w.duration_minutes || 300;
+  const pct = Math.min(100, Math.round(el2/dur*100));
+  const color = rem <= 15 ? 'var(--red)' : rem <= w.trigger_at ? 'var(--yellow)' : 'var(--green)';
+  const gateOpen = rem > w.trigger_at;
   const fmtMin = m => m >= 60 ? `${Math.floor(m/60)}h ${m%60}m` : `${m}m`;
 
   el.innerHTML = `
     <div class="win-row">
-      <div>
-        <div class="win-time" style="color:${color}">${fmtMin(remaining)}</div>
-        <div class="win-label">remaining</div>
-      </div>
-      <div>
-        <span class="badge ${gateOpen ? 'badge-open' : 'badge-closed'}">${gateLabel}</span>
-        <div style="font-size:12px;color:var(--muted);margin-top:6px">mode: ${w.dispatch_mode || 'window_aware'}</div>
-      </div>
+      <div><div class="win-time" style="color:${color}">${fmtMin(rem)}</div><div class="win-label">remaining</div></div>
+      <div><span class="badge ${gateOpen?'badge-open':'badge-closed'}">${gateOpen?'GATE OPEN':'DISPATCHING'}</span>
+      <div style="font-size:11px;color:var(--muted);margin-top:5px">mode: ${w.dispatch_mode||'window_aware'}</div></div>
     </div>
     <div class="win-track"><div class="win-fill" style="width:${pct}%;background:${color}"></div></div>
     <div class="win-meta">
-      <div class="win-item"><span>Elapsed: </span>${fmtMin(elapsed)}</div>
-      <div class="win-item"><span>Duration: </span>${fmtMin(duration)}</div>
-      <div class="win-item"><span>Trigger at: </span>${fmtMin(w.trigger_at)} remaining</div>
+      <div class="win-item"><span>Elapsed: </span>${fmtMin(el2)}</div>
+      <div class="win-item"><span>Duration: </span>${fmtMin(dur)}</div>
+      <div class="win-item"><span>Fires at: </span>${fmtMin(w.trigger_at)} left</div>
     </div>
   `;
 })();
 
-// ── Results Donut ─────────────────────────────────────────────────────────────
+// ── Queue Health ──────────────────────────────────────────────────────────────
 (function(){
-  const results = D.results;
-  if (!results.length) {
-    document.getElementById('results-chart').parentElement.innerHTML = '<div class="empty">No agent runs yet</div>';
+  const tasks = D.later_tasks;
+  if (!tasks.length) {
+    document.getElementById('queue-health').innerHTML = '<div class="empty">No tasks in LATER.md</div>';
     return;
   }
-  const counts = {DONE:0, FAILED:0, NEEDS_HUMAN:0, SKIPPED:0, EMPTY:0, UNKNOWN:0};
-  results.forEach(r => { counts[r.status] = (counts[r.status]||0) + 1; });
-  const nonZero = Object.entries(counts).filter(([,v]) => v > 0);
-  const colors = {
-    DONE: 'rgba(63,185,80,0.85)',
-    FAILED: 'rgba(248,81,73,0.85)',
-    NEEDS_HUMAN: 'rgba(210,153,34,0.85)',
-    SKIPPED: 'rgba(72,79,88,0.85)',
-    EMPTY: 'rgba(139,148,158,0.5)',
-    UNKNOWN: 'rgba(88,166,255,0.5)',
-  };
+  const total = tasks.length;
+  const pending = tasks.filter(t => !t.done);
+  const done = tasks.filter(t => t.done).length;
+  const p0 = pending.filter(t => t.priority==='(P0)').length;
+  const p1 = pending.filter(t => t.priority==='(P1)').length;
+  const p2 = pending.filter(t => t.priority==='(P2)').length;
+
+  const bar = (label, count, max, color) => `
+    <div class="qbar-wrap">
+      <div class="qbar-label"><span>${label}</span><span>${count}</span></div>
+      <div class="qbar"><div class="qbar-fill" style="width:${max>0?Math.round(count/max*100):0}%;background:${color}"></div></div>
+    </div>`;
+
+  document.getElementById('queue-health').innerHTML =
+    bar('Pending', pending.length, total, 'var(--blue)') +
+    bar('Completed', done, total, 'var(--green)') +
+    (pending.length ? '<div style="margin:10px 0 8px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Pending by priority</div>' +
+      bar('P0 Critical', p0, pending.length, 'var(--red)') +
+      bar('P1 Normal', p1, pending.length, 'var(--yellow)') +
+      bar('P2 Low', p2, pending.length, 'var(--blue)') : '');
+})();
+
+// ── Results Donut ─────────────────────────────────────────────────────────────
+(function(){
+  const dispatches = D.dispatches;
+  if (!dispatches.length) {
+    document.getElementById('results-chart').parentElement.innerHTML = '<div class="empty">No dispatches yet</div>';
+    return;
+  }
+  const counts = {};
+  dispatches.forEach(d => { counts[d.result_status] = (counts[d.result_status]||0)+1; });
+  const entries = Object.entries(counts).filter(([,v])=>v>0);
+  const colors = {DONE:'rgba(63,185,80,.85)',FAILED:'rgba(248,81,73,.85)',NEEDS_HUMAN:'rgba(210,153,34,.85)',SKIPPED:'rgba(72,79,88,.85)',EMPTY:'rgba(139,148,158,.5)',PENDING:'rgba(88,166,255,.7)',UNKNOWN:'rgba(88,166,255,.4)'};
   new Chart(document.getElementById('results-chart'), {
     type: 'doughnut',
-    data: {
-      labels: nonZero.map(([k]) => k),
-      datasets: [{
-        data: nonZero.map(([,v]) => v),
-        backgroundColor: nonZero.map(([k]) => colors[k] || '#888'),
-        borderWidth: 0,
-      }]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false, cutout: '60%',
-      plugins: {
-        legend: {
-          position: 'right',
-          labels: { padding: 12, usePointStyle: true, pointStyle: 'rectRounded',
-            generateLabels: ch => ch.data.labels.map((l,i) => ({
-              text: `${l}  ${ch.data.datasets[0].data[i]}`,
-              fillStyle: ch.data.datasets[0].backgroundColor[i],
-              strokeStyle: 'transparent', index: i
-            }))
-          }
-        }
-      }
+    data: { labels: entries.map(([k])=>k), datasets: [{ data: entries.map(([,v])=>v), backgroundColor: entries.map(([k])=>colors[k]||'#888'), borderWidth: 0 }] },
+    options: { responsive:true, maintainAspectRatio:false, cutout:'60%',
+      plugins: { legend: { position:'right', labels: { padding:12, usePointStyle:true, pointStyle:'rectRounded',
+        generateLabels: ch => ch.data.labels.map((l,i)=>({text:`${l}  ${ch.data.datasets[0].data[i]}`, fillStyle:ch.data.datasets[0].backgroundColor[i], strokeStyle:'transparent', index:i}))
+      }}}
     }
   });
 })();
 
 // ── Skip Patterns ─────────────────────────────────────────────────────────────
 (function(){
-  const skips = D.run_log.filter(e => e.event === 'skip');
-  if (!skips.length) {
-    document.getElementById('skip-patterns').innerHTML = '<div class="empty">No skip events</div>';
+  const reasons = D.skip_reasons;
+  const entries = Object.entries(reasons).sort((a,b)=>b[1]-a[1]);
+  if (!entries.length) {
+    document.getElementById('skip-patterns').innerHTML = '<div class="empty">No gate skips</div>';
     return;
   }
-  const reasons = {};
-  skips.forEach(e => { const r = e.reason || 'unknown'; reasons[r] = (reasons[r]||0) + 1; });
-  const top = Object.entries(reasons).sort((a,b) => b[1]-a[1]);
-  document.getElementById('skip-patterns').innerHTML = top.map(([r,c]) =>
+  document.getElementById('skip-patterns').innerHTML = entries.map(([r,c]) =>
     `<span class="skip-tag">${r.replace(/_/g,' ')}<span class="skip-cnt">${c}</span></span>`
   ).join('');
 })();
@@ -316,10 +376,9 @@ document.getElementById('meta').textContent =
   const byDate = {};
   D.run_log.forEach(e => {
     if (!relevant.includes(e.event)) return;
-    const d = (e.ts||'').slice(0,10);
-    if (!d) return;
+    const d = (e.ts||'').slice(0,10); if (!d) return;
     if (!byDate[d]) byDate[d] = {};
-    byDate[d][e.event] = (byDate[d][e.event]||0) + 1;
+    byDate[d][e.event] = (byDate[d][e.event]||0)+1;
   });
   const days = Object.keys(byDate).sort();
   if (!days.length) {
@@ -329,99 +388,72 @@ document.getElementById('meta').textContent =
   new Chart(document.getElementById('timeline-chart'), {
     type: 'bar',
     data: {
-      labels: days.map(d => d.slice(5)),
+      labels: days.map(d=>d.slice(5)),
       datasets: [
-        { label:'Dispatch', data: days.map(d=>(byDate[d].dispatch||0)), backgroundColor:'rgba(88,166,255,0.7)', stack:'s' },
-        { label:'Capture', data: days.map(d=>(byDate[d].capture||0)), backgroundColor:'rgba(63,185,80,0.7)', stack:'s' },
-        { label:'Skip', data: days.map(d=>(byDate[d].skip||0)), backgroundColor:'rgba(72,79,88,0.7)', stack:'s' },
-        { label:'Abandoned', data: days.map(d=>(byDate[d].agent_abandoned||0)), backgroundColor:'rgba(248,81,73,0.7)', stack:'s' },
-        { label:'Conflict', data: days.map(d=>(byDate[d].merge_conflict||0)), backgroundColor:'rgba(210,153,34,0.7)', stack:'s' },
-        { label:'Resume', data: days.map(d=>(byDate[d].resume||0)), backgroundColor:'rgba(188,140,255,0.7)', stack:'s' },
+        {label:'Dispatch', data:days.map(d=>byDate[d].dispatch||0), backgroundColor:'rgba(88,166,255,.7)', stack:'s'},
+        {label:'Capture', data:days.map(d=>byDate[d].capture||0), backgroundColor:'rgba(63,185,80,.7)', stack:'s'},
+        {label:'Skip', data:days.map(d=>byDate[d].skip||0), backgroundColor:'rgba(72,79,88,.7)', stack:'s'},
+        {label:'Abandoned', data:days.map(d=>byDate[d].agent_abandoned||0), backgroundColor:'rgba(248,81,73,.7)', stack:'s'},
+        {label:'Conflict', data:days.map(d=>byDate[d].merge_conflict||0), backgroundColor:'rgba(210,153,34,.7)', stack:'s'},
+        {label:'Resume', data:days.map(d=>byDate[d].resume||0), backgroundColor:'rgba(188,140,255,.7)', stack:'s'},
       ]
     },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: {
-        legend: { labels: { usePointStyle: true, pointStyle: 'rectRounded', padding: 14 } },
-      },
-      scales: {
-        x: { grid: { display: false } },
-        y: { stacked: true, ticks: { stepSize: 1 }, grid: { color: '#21262d' } }
-      }
+    options: { responsive:true, maintainAspectRatio:false,
+      plugins: { legend: { labels: { usePointStyle:true, pointStyle:'rectRounded', padding:14 } } },
+      scales: { x:{grid:{display:false}}, y:{stacked:true, ticks:{stepSize:1}, grid:{color:'#21262d'}} }
     }
   });
 })();
 
-// ── Recent Agent Runs ─────────────────────────────────────────────────────────
-(function(){
-  const results = [...D.results].sort((a,b) => (b.ts||'').localeCompare(a.ts||'')).slice(0,40);
-  if (!results.length) {
-    document.getElementById('result-list').innerHTML = '<div class="empty">No agent runs yet</div>';
-    return;
-  }
-  document.getElementById('result-list').innerHTML = results.map(r => {
-    const ts = r.ts ? r.ts.replace('T',' ').slice(0,16) : '';
-    const st = r.status.toLowerCase();
-    const msg = r.message || r.task_id || '\u2014';
-    return `<div class="result-row">
-      <span class="badge badge-${st}">${r.status}</span>
-      <span class="result-section">${r.section}</span>
-      <span class="result-msg" title="${msg.replace(/"/g,'&quot;')}">${msg}</span>
-      <span class="result-ts">${ts}</span>
-    </div>`;
-  }).join('');
-})();
-
 // ── Failure Patterns ──────────────────────────────────────────────────────────
 (function(){
-  const failures = D.results.filter(r => r.status === 'FAILED' || r.status === 'UNKNOWN');
+  const failures = D.dispatches.filter(d => ['FAILED','UNKNOWN'].includes(d.result_status));
   if (!failures.length) {
     document.getElementById('failure-patterns').innerHTML = '<div class="empty">No failures — nice!</div>';
     return;
   }
-  // Bucket by first meaningful words of message
   const reasons = {};
-  failures.forEach(r => {
-    const msg = r.message || 'unknown error';
-    // Normalize: take first 60 chars, strip task ids
-    const key = msg.replace(/tmp[a-z0-9_]+/gi,'').trim().slice(0,60) || 'unknown';
-    reasons[key] = (reasons[key]||0) + 1;
+  failures.forEach(d => {
+    const msg = d.result_message || 'unknown error';
+    const key = msg.slice(0,70).replace(/tmp[a-z0-9_]+/gi,'').trim() || 'unknown';
+    reasons[key] = (reasons[key]||0)+1;
   });
-  const top = Object.entries(reasons).sort((a,b) => b[1]-a[1]).slice(0,8);
-  const max = top[0][1];
+  const top = Object.entries(reasons).sort((a,b)=>b[1]-a[1]).slice(0,6);
   document.getElementById('failure-patterns').innerHTML = top.map(([r,c]) =>
-    `<div class="fail-row">
-      <div class="fail-bar"><div class="fail-bar-fill" style="width:${Math.round(c/max*100)}%"></div></div>
-      <span class="fail-reason">${r}</span>
-      <span class="fail-count">${c}</span>
-    </div>`
+    `<div class="fail-row"><span class="fail-reason">${r}</span><span class="fail-cnt">${c}</span></div>`
   ).join('');
 })();
 
 // ── Task List ─────────────────────────────────────────────────────────────────
 (function(){
-  const tasks = D.later_tasks;
-  if (!tasks.length) {
+  // Group by repo then section
+  const byRepo = D.later_by_repo;
+  if (!byRepo.length || !byRepo.some(r=>r.tasks.length)) {
     document.getElementById('task-list').innerHTML = '<div class="empty">LATER.md is empty</div>';
     return;
   }
-  // Group by section
-  const sections = {};
-  tasks.forEach(t => {
-    if (!sections[t.section]) sections[t.section] = [];
-    sections[t.section].push(t);
-  });
   let html = '';
-  for (const [sec, items] of Object.entries(sections)) {
-    html += `<div class="task-section-header">${sec}</div>`;
-    items.forEach(t => {
-      const prio = t.priority.replace(/[()]/g,'').toLowerCase();
-      html += `<div class="task-row">
-        <span class="badge badge-${prio}">${t.priority.replace(/[()]/g,'')}</span>
-        <span class="task-text${t.done ? ' done' : ''}">${t.text}</span>
-      </div>`;
+  byRepo.forEach(repo => {
+    if (!repo.tasks.length) return;
+    if (byRepo.filter(r=>r.tasks.length).length > 1) {
+      html += `<div style="font-size:12px;font-weight:700;color:var(--purple);padding:8px 0 4px;border-top:1px solid var(--border);margin-top:4px">${repo.repo_short}</div>`;
+    }
+    const sections = {};
+    repo.tasks.forEach(t => {
+      if (!sections[t.section]) sections[t.section] = [];
+      sections[t.section].push(t);
     });
-  }
+    for (const [sec, items] of Object.entries(sections)) {
+      html += `<div class="task-section-hdr">${sec}</div>`;
+      items.forEach(t => {
+        const prio = t.priority.replace(/[()]/g,'').toLowerCase();
+        html += `<div class="task-row">
+          <span class="badge badge-${prio}">${t.priority.replace(/[()]/g,'')}</span>
+          <span class="task-text${t.done?' done':''}">${t.text}</span>
+        </div>`;
+      });
+    }
+  });
   document.getElementById('task-list').innerHTML = html;
 })();
 </script>
