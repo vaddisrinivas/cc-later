@@ -1,6 +1,8 @@
 ---
 name: cc-later
-description: Queue out-of-scope follow-up work in .claude/LATER.md using a strict, dispatchable format. Parallel agents execute tasks near window end.
+description: Queue out-of-scope follow-up work in .claude/LATER.md using a strict, dispatchable format. Parallel agents execute tasks near window end. Subcommands: status, dashboard.
+user-invocable: true
+allowed-tools: Bash
 ---
 
 # LATER Skill
@@ -141,3 +143,21 @@ If you need to add tests for code that another section is refactoring:
 ```
 
 Shows window state, queue, gate status, and recent runs.
+
+---
+
+## Subcommand handling
+
+When the user invokes `/cc-later:status`, run:
+
+```bash
+uv run --project ${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/scripts/status.py
+```
+
+When the user invokes `/cc-later:dashboard`, run:
+
+```bash
+uv run --project ${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/scripts/dashboard.py
+```
+
+This opens a visual dashboard in the browser showing queue health, per-project dispatch history, agent results, window status, and failure patterns.
