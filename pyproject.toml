@@ -25,6 +25,7 @@ dependencies = [
     "pydantic-settings>=2.0",
     "filelock>=3.0",
     "pendulum>=3.0",
+    "pyte>=0.8.2",
 ]
 
 [dependency-groups]

@@ -1,6 +1,6 @@
 {
   "name": "cc-later",
-  "version": "4.2.0",
+  "version": "4.3.0",
   "description": "Run LATER.md tasks automatically near window end, with limit-aware auto-resume.",
   "author": {
     "name": "vaddisrinivas",

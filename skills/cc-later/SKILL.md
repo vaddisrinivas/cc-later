@@ -1,6 +1,6 @@
 ---
 name: cc-later
-description: Queue out-of-scope follow-up work in .claude/LATER.md using a strict, dispatchable format. Parallel agents execute tasks near window end. Subcommands: status, dashboard.
+description: Queue out-of-scope follow-up work in .claude/LATER.md using a strict, dispatchable format. Parallel agents execute tasks near window end. Subcommands: status, dashboard, monitor.
 user-invocable: true
 allowed-tools: Bash
 ---
@@ -161,3 +161,19 @@ uv run --project ${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/scripts/das
 ```
 
 This opens a visual dashboard in the browser showing queue health, per-project dispatch history, agent results, window status, and failure patterns.
+
+When the user invokes `/cc-later:monitor`, run:
+
+```bash
+uv run --project ${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/scripts/monitor.py --once
+```
+
+Shows window state, budget, agent health, plan info, burn rate, and limit event history.
+
+To install always-on monitoring (launchd, survives across sessions):
+
+```bash
+uv run --project ${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/scripts/monitor.py --install --interval 15
+```
+
+For session-level periodic monitoring, use CronCreate to schedule `/cc-later:monitor` every 15 minutes.

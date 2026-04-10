@@ -19,15 +19,17 @@ from pydantic import BaseModel, Field, field_validator
 
 APP_DIR_ENV = "CC_LATER_APP_DIR"
 DEFAULT_WINDOW_MINUTES = 300
-PLAN_WINDOW_MINUTES: dict[str, int] = {
-    "free": 300,
-    "pro": 300,
-    "max": 300,
-    "team": 300,
-    "enterprise": 300,
+PLAN_LIMITS: dict[str, dict[str, Any]] = {
+    "free":       {"window_minutes": 300, "context_k": 200, "models": ["sonnet", "haiku"]},
+    "pro":        {"window_minutes": 300, "context_k": 200, "models": ["opus", "sonnet", "haiku"]},
+    "max":        {"window_minutes": 300, "context_k": 200, "models": ["opus", "sonnet", "haiku"], "extended_thinking": True},
+    "team":       {"window_minutes": 300, "context_k": 200, "models": ["opus", "sonnet", "haiku"]},
+    "enterprise": {"window_minutes": 300, "context_k": 200, "models": ["opus", "sonnet", "haiku"]},
     # All plans use a 5-hour (300m) rolling window per Anthropic docs.
     # Enterprise/usage-based plans may differ — override with WINDOW_DURATION_MINUTES.
 }
+# Compat alias: dict[str, int] mapping plan -> window_minutes
+PLAN_WINDOW_MINUTES: dict[str, int] = {k: v["window_minutes"] for k, v in PLAN_LIMITS.items()}
 LIMIT_MARKERS = (
     "rate limit",
     "usage limit",
@@ -101,6 +103,13 @@ class NudgeConfig(BaseModel):
     max_retries: int = 2
 
 
+class MonitorConfig(BaseModel):
+    warn_window_minutes: int = Field(default=60, ge=0)
+    warn_budget_pct: int = Field(default=70, ge=0, le=100)
+    notify_enabled: bool = True
+    query_claude: bool = False
+
+
 class Config(BaseModel):
     plan: str = "max"
     paths: PathsConfig = Field(default_factory=PathsConfig)
@@ -111,6 +120,7 @@ class Config(BaseModel):
     auto_resume: AutoResumeConfig = Field(default_factory=AutoResumeConfig)
     compact: CompactConfig = Field(default_factory=CompactConfig)
     nudge: NudgeConfig = Field(default_factory=NudgeConfig)
+    monitor: MonitorConfig = Field(default_factory=MonitorConfig)
 
     @field_validator("plan")
     @classmethod
@@ -170,12 +180,37 @@ class WindowState:
     remaining_minutes: int
     total_input_tokens: int
     total_output_tokens: int
+    burn_rate_tpm: int = 0
+    projected_exhaustion_minutes: int | None = None
 
 
 @dataclass
 class BudgetState:
     used_tokens: int
     pct_used: float
+
+
+@dataclass
+class UsageInfo:
+    """Live usage data scraped from Claude CLI /usage TUI."""
+    session_pct: int | None = None        # % of session window used
+    session_reset: str | None = None      # reset time string, e.g. "1pm"
+    weekly_pct: int | None = None         # % of weekly budget used
+    weekly_reset: str | None = None       # weekly reset string
+    extra_usage_usd: float | None = None  # overage in USD
+
+
+@dataclass
+class MonitorSnapshot:
+    ts: str
+    window: WindowState | None
+    budget: BudgetState
+    plan: str
+    plan_limits: dict[str, Any]
+    agents_in_flight: int
+    agents_stale: int
+    limit_events_24h: dict[str, int]
+    usage_info: UsageInfo | None = None
 
 
 def app_dir() -> Path:
@@ -326,6 +361,12 @@ def load_config() -> Config:
             enabled=_parse_bool(raw.get("NUDGE_ENABLED", "true")),
             stale_minutes=_safe_int(raw.get("NUDGE_STALE_MINUTES", ""), 10),
             max_retries=_safe_int(raw.get("NUDGE_MAX_RETRIES", ""), 2),
+        ),
+        monitor=MonitorConfig(
+            warn_window_minutes=_safe_int(raw.get("MONITOR_WARN_WINDOW_MINUTES", ""), 60),
+            warn_budget_pct=_safe_int(raw.get("MONITOR_WARN_BUDGET_PCT", ""), 70),
+            notify_enabled=_parse_bool(raw.get("MONITOR_NOTIFY_ENABLED", "true")),
+            query_claude=_parse_bool(raw.get("MONITOR_QUERY_CLAUDE", "false")),
         ),
     )
 
@@ -713,11 +754,14 @@ def _compute_window_state_inner(roots: list[Path], now_utc: datetime, session_id
             output_tokens += _as_int(usage.get("output_tokens"))
 
     elapsed = max(0, int((now_utc - earliest).total_seconds() // 60))
+    total_tokens = input_tokens + output_tokens
+    burn_rate = total_tokens // max(1, elapsed) if elapsed > 0 else 0
     return WindowState(
         elapsed_minutes=elapsed,
         remaining_minutes=max(0, window_duration - elapsed),
         total_input_tokens=input_tokens,
         total_output_tokens=output_tokens,
+        burn_rate_tpm=burn_rate,
     )
 
 
@@ -1398,13 +1442,26 @@ def build_status(cwd_hint: str | None = None) -> str:
     budget = compute_budget_state(roots, now_utc, cfg.limits.weekly_budget_tokens)
     watch_paths = resolve_watch_paths(cfg, cwd_hint)
 
-    lines = ["## cc-later Status", "", "### Window", f"  Mode: {cfg.window.dispatch_mode}"]
+    plan_limits = PLAN_LIMITS.get(cfg.plan, PLAN_LIMITS["max"])
+    lines = ["## cc-later Status", ""]
+
+    # Plan info
+    lines.append("### Plan")
+    lines.append(f"  Tier: {cfg.plan}")
+    lines.append(f"  Models: {', '.join(plan_limits.get('models', []))}")
+    lines.append(f"  Context: {plan_limits.get('context_k', '?')}k")
+    if plan_limits.get("extended_thinking"):
+        lines.append("  Extended thinking: yes")
+
+    lines.extend(["", "### Window", f"  Mode: {cfg.window.dispatch_mode}"])
     if window_state is None:
         lines.extend(["  State: unknown", "  Next window: starts on next Claude request"])
     else:
         end_local = (now_utc + timedelta(minutes=window_state.remaining_minutes)).astimezone()
         lines.append(f"  Elapsed/Remaining: {window_state.elapsed_minutes}m / {window_state.remaining_minutes}m")
         lines.append(f"  Tokens: {window_state.total_input_tokens:,} in / {window_state.total_output_tokens:,} out")
+        if window_state.burn_rate_tpm > 0:
+            lines.append(f"  Burn rate: {window_state.burn_rate_tpm:,} tokens/min")
         lines.append(f"  Window ends: {end_local.strftime('%Y-%m-%d %H:%M %Z')}")
         if window_state.remaining_minutes <= 0:
             lines.append("  Next window: starts on next Claude request")
@@ -1473,6 +1530,16 @@ def build_status(cwd_hint: str | None = None) -> str:
         ts = _parse_iso(item.get("ts"))
         when = ts.astimezone().strftime("%m-%d %H:%M") if ts else "??"
         lines.append(f"  {when} {item.get('event','?'):16} {item.get('reason') or ''}")
+
+    lines.extend(["", "### Limit Events (24h)"])
+    limit_events = _scan_limit_events(hours=24)
+    active = {k: v for k, v in limit_events.items() if v > 0}
+    if active:
+        for event, count in sorted(active.items()):
+            lines.append(f"  {event}: {count}")
+    else:
+        lines.append("  none")
+
     return "\n".join(lines) + "\n"
 
 
@@ -1679,6 +1746,388 @@ def capture_from_payload(payload: dict[str, Any]) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Monitor — periodic window/budget/agent monitoring
+# ---------------------------------------------------------------------------
+
+_LIMIT_EVENT_TYPES = frozenset({
+    "window_exhausted", "window_reset_detected", "budget_limit",
+    "nudge_stale", "nudge_dead", "agent_abandoned",
+})
+
+
+def _scan_limit_events(hours: int = 24) -> dict[str, int]:
+    """Count limit-related events in run_log.jsonl within the last *hours*."""
+    counts: dict[str, int] = {e: 0 for e in _LIMIT_EVENT_TYPES}
+    log_path = run_log_path()
+    if not log_path.exists():
+        return counts
+    cutoff = pendulum.now("UTC") - timedelta(hours=hours)
+    try:
+        size = log_path.stat().st_size
+        # Read tail (~32KB) to avoid loading full log
+        with log_path.open("r", encoding="utf-8") as fh:
+            if size > 32768:
+                fh.seek(size - 32768)
+                fh.readline()  # skip partial line
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                event = row.get("event", "")
+                if event not in _LIMIT_EVENT_TYPES:
+                    continue
+                ts = _parse_iso(row.get("ts"))
+                if ts is not None and ts >= cutoff:
+                    counts[event] = counts.get(event, 0) + 1
+    except OSError:
+        pass
+    return counts
+
+
+def _notify_macos(title: str, message: str) -> None:
+    """Send macOS notification via osascript."""
+    try:
+        subprocess.run(
+            ["osascript", "-e", f'display notification "{message}" with title "{title}"'],
+            capture_output=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _parse_usage_screen(text: str) -> UsageInfo | None:
+    """Parse /usage TUI rendered text into UsageInfo. Returns None if no data found."""
+    info = UsageInfo()
+    found = False
+
+    # Session percentage: "43% used" or "43% of session used"
+    m = re.search(r'(\d+)%\s+(?:of session\s+)?used', text, re.IGNORECASE)
+    if m:
+        info.session_pct = int(m.group(1))
+        found = True
+
+    # Reset time: "Resets 1pm", "Resets at 1:00 PM", "Resets 13:00"
+    m = re.search(r'[Rr]esets?\s+(?:at\s+)?(\d+(?::\d+)?(?:\s*[aApP][mM])?)', text)
+    if m:
+        info.session_reset = m.group(1).strip()
+        found = True
+
+    # Weekly percentage: "Weekly: 25% used" or "Weekly usage: 25%"
+    m = re.search(r'[Ww]eekly[^0-9]*(\d+)%', text)
+    if m:
+        info.weekly_pct = int(m.group(1))
+        found = True
+
+    # Weekly reset: "Weekly resets Monday" or "Resets Monday"
+    m = re.search(r'[Ww]eekly[^.]*[Rr]esets?\s+(\w+)', text)
+    if m:
+        info.weekly_reset = m.group(1)
+        found = True
+
+    # Extra usage / overage: "$12.34 extra" or "Extra usage: $12.34"
+    m = re.search(r'\$(\d+(?:\.\d+)?)\s+(?:extra|overage|additional)', text, re.IGNORECASE)
+    if not m:
+        m = re.search(r'[Ee]xtra\s+usage[:\s]+\$(\d+(?:\.\d+)?)', text)
+    if m:
+        info.extra_usage_usd = float(m.group(1))
+        found = True
+
+    return info if found else None
+
+
+def query_claude_plan_info() -> UsageInfo | None:
+    """Scrape /usage from Claude CLI via PTY to get live session/weekly usage.
+
+    Works only for subscription (claude.ai) accounts. Org/API accounts return None.
+    Results cached to ~/.cc-later/usage_info.json for 5 minutes.
+    """
+    import select
+    import time
+
+    try:
+        import pty
+    except ImportError:
+        return None  # Windows or environments without PTY
+
+    try:
+        import pyte
+    except ImportError:
+        return None
+
+    # Check cache (5m TTL — short enough to be useful, long enough to avoid hammering)
+    cache_path = app_dir() / "usage_info.json"
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            cached_ts = _parse_iso(cached.get("_cached_at"))
+            if cached_ts and (pendulum.now("UTC") - cached_ts).total_seconds() < 300:
+                if cached.get("_unavailable"):
+                    return None
+                return UsageInfo(
+                    session_pct=cached.get("session_pct"),
+                    session_reset=cached.get("session_reset"),
+                    weekly_pct=cached.get("weekly_pct"),
+                    weekly_reset=cached.get("weekly_reset"),
+                    extra_usage_usd=cached.get("extra_usage_usd"),
+                )
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    claude = _find_claude_bin()
+    if not claude:
+        return None
+
+    COLS, ROWS = 120, 40
+    screen = pyte.Screen(COLS, ROWS)
+    stream = pyte.ByteStream(screen)
+
+    def read_and_feed(fd: int, duration: float) -> None:
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            r, _, _ = select.select([fd], [], [], min(0.1, remaining))
+            if r:
+                try:
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        break
+                    stream.feed(chunk)
+                except OSError:
+                    break
+
+    pid = fd = None
+    try:
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.environ["COLUMNS"] = str(COLS)
+            os.environ["LINES"] = str(ROWS)
+            os.environ["TERM"] = "xterm-256color"
+            os.execvp(claude, [claude])
+            os._exit(1)
+
+        # parent: let claude start up
+        read_and_feed(fd, 5.0)
+
+        # send /usage command
+        os.write(fd, b"/usage\r")
+
+        # wait for backend to respond and TUI to render
+        read_and_feed(fd, 8.0)
+
+        # render the screen buffer
+        display_lines = screen.display  # list of fixed-width strings
+        text = "\n".join(line.rstrip() for line in display_lines)
+
+        # gracefully exit
+        try:
+            os.write(fd, b"/exit\r")
+            read_and_feed(fd, 1.0)
+        except OSError:
+            pass
+
+        # detect org/API mode (no subscription)
+        if any(phrase in text.lower() for phrase in [
+            "only available for subscription",
+            "not available for",
+            "claude api",
+        ]):
+            try:
+                cache_path.write_text(
+                    json.dumps({"_unavailable": True, "_cached_at": pendulum.now("UTC").isoformat()}),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            return None
+
+        info = _parse_usage_screen(text)
+        if info:
+            cached_data = {
+                "_cached_at": pendulum.now("UTC").isoformat(),
+                "session_pct": info.session_pct,
+                "session_reset": info.session_reset,
+                "weekly_pct": info.weekly_pct,
+                "weekly_reset": info.weekly_reset,
+                "extra_usage_usd": info.extra_usage_usd,
+            }
+            try:
+                cache_path.write_text(json.dumps(cached_data), encoding="utf-8")
+            except OSError:
+                pass
+        return info
+
+    except OSError:
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except (OSError, ChildProcessError):
+                pass
+
+
+def run_monitor(cwd_hint: str | None = None, notify: bool = True) -> MonitorSnapshot:
+    """Compute full monitoring snapshot. Used by external cron and CronCreate."""
+    cfg = load_config()
+    state = load_state()
+    now_utc = pendulum.now("UTC")
+    roots = resolve_jsonl_roots(cfg)
+    window_start_hint = _parse_iso(state.window_start_ts)
+    window_state = compute_window_state(
+        roots, now_utc,
+        window_duration=cfg.window.duration_minutes,
+        window_start_hint=window_start_hint,
+    )
+    budget = compute_budget_state(roots, now_utc, cfg.limits.weekly_budget_tokens)
+
+    # Count in-flight and stale agents
+    agents_in_flight = 0
+    agents_stale = 0
+    for repo_state_raw in state.repos.values():
+        repo_state = repo_state_raw if isinstance(repo_state_raw, RepoState) else RepoState()
+        for agent in repo_state.agents:
+            agents_in_flight += 1
+            if _is_agent_stale(agent, now_utc, cfg.nudge.stale_minutes):
+                agents_stale += 1
+
+    limit_events = _scan_limit_events(hours=24)
+    plan_limits = PLAN_LIMITS.get(cfg.plan, PLAN_LIMITS["max"])
+
+    # Optionally query live usage from Claude CLI via PTY (/usage TUI scraping).
+    # Only works for subscription accounts; org/API accounts return None gracefully.
+    usage_info: UsageInfo | None = None
+    if cfg.monitor.query_claude:
+        usage_info = query_claude_plan_info()
+
+    snap = MonitorSnapshot(
+        ts=now_utc.isoformat(),
+        window=window_state,
+        budget=budget,
+        plan=cfg.plan,
+        plan_limits=plan_limits,
+        agents_in_flight=agents_in_flight,
+        agents_stale=agents_stale,
+        limit_events_24h=limit_events,
+        usage_info=usage_info,
+    )
+
+    # Write snapshot to disk
+    monitor_path = app_dir() / "monitor.json"
+    try:
+        monitor_path.write_text(json.dumps(asdict(snap), default=str), encoding="utf-8")
+    except OSError:
+        pass
+
+    # macOS notifications on threshold crossings
+    if notify and cfg.monitor.notify_enabled:
+        warnings: list[str] = []
+        if window_state and window_state.remaining_minutes <= cfg.monitor.warn_window_minutes:
+            warnings.append(f"Window: {window_state.remaining_minutes}m left")
+        if budget.pct_used * 100 >= cfg.monitor.warn_budget_pct:
+            warnings.append(f"Budget: {budget.pct_used*100:.0f}%")
+        if agents_stale > 0:
+            warnings.append(f"{agents_stale} stale agent(s)")
+        if warnings:
+            _notify_macos("cc-later", " | ".join(warnings))
+
+    return snap
+
+
+def format_monitor_compact(snap: MonitorSnapshot) -> str:
+    """One-line status for CronCreate/session output."""
+    parts = [f"Plan: {snap.plan}"]
+    if snap.window:
+        parts.append(f"Window: {snap.window.remaining_minutes}m left")
+        if snap.window.burn_rate_tpm > 0:
+            parts.append(f"Burn: {snap.window.burn_rate_tpm:,}t/min")
+    else:
+        parts.append("Window: unknown")
+    parts.append(f"Budget: {snap.budget.pct_used*100:.0f}%")
+    if snap.usage_info and snap.usage_info.session_pct is not None:
+        reset_str = f" (resets {snap.usage_info.session_reset})" if snap.usage_info.session_reset else ""
+        parts.append(f"Session: {snap.usage_info.session_pct}%{reset_str}")
+    if snap.agents_in_flight:
+        parts.append(f"{snap.agents_in_flight} agent(s)")
+    if snap.agents_stale:
+        parts.append(f"{snap.agents_stale} stale")
+    return "[cc-later] " + " | ".join(parts)
+
+
+def format_monitor_full(snap: MonitorSnapshot) -> str:
+    """Multi-line status for external cron/verbose output."""
+    lines = ["## cc-later Monitor", ""]
+
+    # Plan info
+    lines.append(f"Plan: {snap.plan}")
+    pl = snap.plan_limits
+    models = ", ".join(pl.get("models", []))
+    lines.append(f"  Models: {models}")
+    lines.append(f"  Context: {pl.get('context_k', '?')}k")
+    if pl.get("extended_thinking"):
+        lines.append("  Extended thinking: yes")
+
+    # Window
+    lines.append("")
+    if snap.window:
+        lines.append(f"Window: {snap.window.elapsed_minutes}m elapsed / {snap.window.remaining_minutes}m remaining")
+        lines.append(f"  Tokens: {snap.window.total_input_tokens:,} in / {snap.window.total_output_tokens:,} out")
+        if snap.window.burn_rate_tpm > 0:
+            lines.append(f"  Burn rate: {snap.window.burn_rate_tpm:,} tokens/min")
+    else:
+        lines.append("Window: no active session detected")
+
+    # Budget
+    lines.append(f"\nBudget: {snap.budget.used_tokens:,} tokens ({snap.budget.pct_used*100:.1f}%)")
+
+    # Live usage from Claude CLI /usage (only if query_claude=true and subscription account)
+    if snap.usage_info:
+        ui = snap.usage_info
+        lines.append("\nLive usage (from Claude CLI):")
+        if ui.session_pct is not None:
+            reset_str = f", resets {ui.session_reset}" if ui.session_reset else ""
+            lines.append(f"  Session: {ui.session_pct}% used{reset_str}")
+        if ui.weekly_pct is not None:
+            weekly_reset_str = f", resets {ui.weekly_reset}" if ui.weekly_reset else ""
+            lines.append(f"  Weekly: {ui.weekly_pct}% used{weekly_reset_str}")
+        if ui.extra_usage_usd is not None:
+            lines.append(f"  Extra usage: ${ui.extra_usage_usd:.2f}")
+
+    # Agents
+    if snap.agents_in_flight:
+        lines.append(f"\nAgents: {snap.agents_in_flight} in-flight ({snap.agents_stale} stale)")
+    else:
+        lines.append("\nAgents: none")
+
+    # Limit events
+    active_events = {k: v for k, v in snap.limit_events_24h.items() if v > 0}
+    if active_events:
+        lines.append("\nLimit events (24h):")
+        for event, count in sorted(active_events.items()):
+            lines.append(f"  {event}: {count}")
+    else:
+        lines.append("\nLimit events (24h): none")
+
+    return "\n".join(lines) + "\n"
+
+
+def run_monitor_cli(cwd_hint: str | None = None) -> int:
+    """Entry point for /cc-later:monitor command and scripts/monitor.py --once."""
+    snap = run_monitor(cwd_hint=cwd_hint, notify=False)
+    print(format_monitor_full(snap))
+    return 0
+
+
 __all__ = [
     "APP_DIR_ENV",
     "AutoResumeConfig",
@@ -1688,7 +2137,11 @@ __all__ = [
     "DispatchConfig",
     "LaterConfig",
     "LimitsConfig",
+    "MonitorConfig",
+    "MonitorSnapshot",
     "NudgeConfig",
+    "UsageInfo",
+    "PLAN_LIMITS",
     "PathsConfig",
     "RepoState",
     "Section",
@@ -1702,14 +2155,19 @@ __all__ = [
     "compute_window_state",
     "detect_limit_exhaustion",
     "ensure_later_file",
+    "format_monitor_compact",
+    "format_monitor_full",
     "load_config",
     "load_state",
     "mark_done_in_content",
     "parse_result_summary",
     "parse_tasks",
+    "query_claude_plan_info",
     "resolve_watch_paths",
     "run_compact_inject",
     "run_handler",
+    "run_monitor",
+    "run_monitor_cli",
     "run_stats",
     "run_status",
     "save_state",
