@@ -454,7 +454,7 @@ class TestWorktreeFunctions(_BaseTestCase):
         self.assertIn("worktree", cmds[0])
         self.assertIn("remove", cmds[0])
         self.assertIn("branch", cmds[1])
-        self.assertIn("-d", cmds[1])
+        self.assertIn("-D", cmds[1])  # force delete — safe for cc-later worktree branches
 
     def test_ensure_gitignore_no_file_creates(self):
         gitignore = self.repo / ".gitignore"

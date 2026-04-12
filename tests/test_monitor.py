@@ -307,6 +307,196 @@ class LaunchdTests(unittest.TestCase):
         root = _plugin_root()
         self.assertTrue((root / "cc_later").is_dir())
 
+    def test_plist_uses_python3_not_sys_executable(self):
+        """ProgramArguments must use 'python3', not a hardcoded sys.executable path."""
+        import plistlib
+        import sys
+        import tempfile
+        from unittest.mock import patch as _patch
+        from cc_later import launchd
+
+        with tempfile.TemporaryDirectory() as td:
+            fake_plist = Path(td) / "com.cc-later.monitor.plist"
+            fake_log = Path(td) / "logs"
+            fake_log.mkdir()
+
+            with _patch.object(launchd, "_plist_path", return_value=fake_plist), \
+                 _patch.object(launchd, "_log_dir", return_value=fake_log), \
+                 _patch("subprocess.run"):
+                launchd.install_launchd_plist(interval_minutes=15)
+
+            with fake_plist.open("rb") as f:
+                plist = plistlib.load(f)
+
+        args = plist["ProgramArguments"]
+        self.assertIn("python3", args, "ProgramArguments must use 'python3'")
+        self.assertNotIn(sys.executable, args,
+                         "ProgramArguments must NOT hardcode sys.executable")
+
+    def test_plist_has_run_at_load(self):
+        """Plist must have RunAtLoad=True so first check runs immediately."""
+        import plistlib
+        import tempfile
+        from unittest.mock import patch as _patch
+        from cc_later import launchd
+
+        with tempfile.TemporaryDirectory() as td:
+            fake_plist = Path(td) / "com.cc-later.monitor.plist"
+            fake_log = Path(td) / "logs"
+            fake_log.mkdir()
+
+            with _patch.object(launchd, "_plist_path", return_value=fake_plist), \
+                 _patch.object(launchd, "_log_dir", return_value=fake_log), \
+                 _patch("subprocess.run"):
+                launchd.install_launchd_plist(interval_minutes=15)
+
+            with fake_plist.open("rb") as f:
+                plist = plistlib.load(f)
+
+        self.assertTrue(plist.get("RunAtLoad"), "Plist must have RunAtLoad=True")
+
+    def test_plist_interval_seconds(self):
+        """StartInterval must be interval_minutes * 60."""
+        import plistlib
+        import tempfile
+        from unittest.mock import patch as _patch
+        from cc_later import launchd
+
+        with tempfile.TemporaryDirectory() as td:
+            fake_plist = Path(td) / "com.cc-later.monitor.plist"
+            fake_log = Path(td) / "logs"
+            fake_log.mkdir()
+
+            with _patch.object(launchd, "_plist_path", return_value=fake_plist), \
+                 _patch.object(launchd, "_log_dir", return_value=fake_log), \
+                 _patch("subprocess.run"):
+                launchd.install_launchd_plist(interval_minutes=20)
+
+            with fake_plist.open("rb") as f:
+                plist = plistlib.load(f)
+
+        self.assertEqual(plist["StartInterval"], 1200)  # 20 * 60
+
+
+class RunMonitorTests(unittest.TestCase):
+    def test_run_monitor_writes_snapshot_file(self):
+        """run_monitor must write monitor.json to app_dir."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            env_path = td_path / "config.env"
+            env_path.write_text("PLAN=max\nMONITOR_NOTIFY_ENABLED=false\n")
+            state_path_val = td_path / "state.json"
+            state_path_val.write_text("{}")
+
+            with patch.object(core, "config_path", return_value=env_path), \
+                 patch.object(core, "app_dir", return_value=td_path), \
+                 patch.object(core, "state_path", return_value=state_path_val), \
+                 patch.object(core, "resolve_watch_paths", return_value=[td_path]), \
+                 patch.object(core, "resolve_jsonl_roots", return_value=[]):
+                snap = core.run_monitor(notify=False)
+
+            monitor_json = td_path / "monitor.json"
+            self.assertTrue(monitor_json.exists(), "monitor.json was not written")
+            data = json.loads(monitor_json.read_text())
+            self.assertEqual(data["plan"], "max")
+
+    def test_run_monitor_no_notify_below_threshold(self):
+        """No macOS notification when window and budget are fine."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            env_path = td_path / "config.env"
+            env_path.write_text(
+                "PLAN=max\n"
+                "MONITOR_NOTIFY_ENABLED=true\n"
+                "MONITOR_WARN_WINDOW_MINUTES=30\n"
+                "MONITOR_WARN_BUDGET_PCT=90\n"
+            )
+            state_path_val = td_path / "state.json"
+            state_path_val.write_text("{}")
+
+            with patch.object(core, "config_path", return_value=env_path), \
+                 patch.object(core, "app_dir", return_value=td_path), \
+                 patch.object(core, "state_path", return_value=state_path_val), \
+                 patch.object(core, "resolve_watch_paths", return_value=[td_path]), \
+                 patch.object(core, "resolve_jsonl_roots", return_value=[]), \
+                 patch.object(core, "_notify_macos") as mock_notify:
+                # window=None (no data), budget=0% — both below thresholds
+                core.run_monitor(notify=True)
+                mock_notify.assert_not_called()
+
+    def test_format_monitor_full_with_usage_info(self):
+        usage = core.UsageInfo(session_pct=55, session_reset="3pm",
+                               weekly_pct=30, weekly_reset="Monday",
+                               extra_usage_usd=2.50)
+        snap = core.MonitorSnapshot(
+            ts="2026-04-11T10:00:00Z",
+            window=core.WindowState(60, 240, 1000, 500, 25),
+            budget=core.BudgetState(1000000, 0.1),
+            plan="max",
+            plan_limits=core.PLAN_LIMITS["max"],
+            agents_in_flight=0,
+            agents_stale=0,
+            limit_events_24h={},
+            usage_info=usage,
+        )
+        out = core.format_monitor_full(snap)
+        self.assertIn("55%", out)
+        self.assertIn("3pm", out)
+        self.assertIn("Monday", out)
+        self.assertIn("$2.50", out)
+
+    def test_format_monitor_compact_with_usage_info(self):
+        usage = core.UsageInfo(session_pct=72, session_reset="2pm")
+        snap = core.MonitorSnapshot(
+            ts="2026-04-11T10:00:00Z",
+            window=None,
+            budget=core.BudgetState(0, 0.0),
+            plan="pro",
+            plan_limits=core.PLAN_LIMITS["pro"],
+            agents_in_flight=0,
+            agents_stale=0,
+            limit_events_24h={},
+            usage_info=usage,
+        )
+        line = core.format_monitor_compact(snap)
+        self.assertIn("72%", line)
+        self.assertIn("2pm", line)
+
+    def test_build_status_includes_limit_events_section(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            env_path = td_path / "config.env"
+            env_path.write_text("PLAN=max\n")
+            state_path_val = td_path / "state.json"
+            state_path_val.write_text("{}")
+
+            with patch.object(core, "config_path", return_value=env_path), \
+                 patch.object(core, "app_dir", return_value=td_path), \
+                 patch.object(core, "state_path", return_value=state_path_val), \
+                 patch.object(core, "resolve_watch_paths", return_value=[td_path]), \
+                 patch.object(core, "resolve_jsonl_roots", return_value=[]):
+                status = core.build_status()
+
+        self.assertIn("### Limit Events (24h)", status)
+
+    def test_scan_limit_events_new_markers(self):
+        """window_exhausted, budget_limit tracked correctly."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "log.jsonl"
+            from datetime import datetime, timezone, timedelta
+            now = datetime.now(timezone.utc)
+            recent = (now - timedelta(hours=1)).isoformat()
+            log.write_text(
+                json.dumps({"ts": recent, "event": "window_exhausted"}) + "\n"
+                + json.dumps({"ts": recent, "event": "nudge_dead"}) + "\n"
+                + json.dumps({"ts": recent, "event": "agent_abandoned"}) + "\n"
+            )
+            with patch.object(core, "run_log_path", return_value=log):
+                events = core._scan_limit_events(hours=24)
+        self.assertEqual(events["window_exhausted"], 1)
+        self.assertEqual(events["nudge_dead"], 1)
+        self.assertEqual(events["agent_abandoned"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

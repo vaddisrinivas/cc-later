@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import plistlib
 import subprocess
-import sys
 from pathlib import Path
 
 PLIST_NAME = "com.cc-later.monitor"
@@ -58,7 +57,7 @@ def install_launchd_plist(interval_minutes: int = 15) -> Path:
             "run",
             "--project",
             root,
-            sys.executable,
+            "python3",
             str(Path(root) / "scripts" / "monitor.py"),
             "--once",
         ],
@@ -67,14 +66,17 @@ def install_launchd_plist(interval_minutes: int = 15) -> Path:
         "StandardErrorPath": str(log_dir / "monitor.log"),
         "RunAtLoad": True,
         "EnvironmentVariables": {
-            "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",
+            "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/sbin",
         },
     }
 
     with plist_path.open("wb") as f:
         plistlib.dump(plist, f)
 
-    subprocess.run(["launchctl", "load", str(plist_path)], check=True)
+    result = subprocess.run(["launchctl", "load", str(plist_path)], capture_output=True)
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="replace").strip()
+        print(f"[cc-later] warning: launchctl load returned {result.returncode}: {stderr}")
     return plist_path
 
 
@@ -83,7 +85,7 @@ def uninstall_launchd_plist() -> bool:
     plist_path = _plist_path()
     if not plist_path.exists():
         return False
-    subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
+    subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True, check=False)
     plist_path.unlink(missing_ok=True)
     return True
 

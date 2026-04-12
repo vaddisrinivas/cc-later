@@ -513,7 +513,7 @@ class RunStatsTests(unittest.TestCase):
             # Generate enough tokens for a meaningful cost:
             # 10M input tokens opus @ $15/M = $150 API cost
             # 7d plan cost = 7/30 * 200 = ~$46.67
-            # savings = (1 - 46.67/150) * 100 = ~68.9%
+            # savings = (1 - 46.67/150) * 100 = ~68.9% (API > sub → savings vs API)
             self._write_jsonl(fp, [
                 self._make_row("claude-opus-4-6", input_tokens=10_000_000),
             ])
@@ -521,7 +521,7 @@ class RunStatsTests(unittest.TestCase):
                 with patch("builtins.print") as mock_print:
                     core.run_stats(days=7)
                     output = mock_print.call_args[0][0]
-                    self.assertIn("Savings:", output)
+                    self.assertIn("Savings vs API", output)
 
     def test_zero_usage_rows_skipped(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1353,27 +1353,108 @@ class StatsNegativeTests(unittest.TestCase):
                     self.assertNotIn("claude-opus-4-6", output)
 
     def test_savings_negative_when_sub_cost_exceeds_api_cost(self):
-        """run_stats when savings would be negative (sub cost > api cost) shows negative %."""
+        """run_stats when API cost < sub cost shows 'API is cheaper' line."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             fp = root / "test.jsonl"
             # Tiny usage: 100 input tokens at sonnet $3/M = $0.0003
-            # 7d sub cost = 7/30 * 200 = ~$46.67
-            # savings = (1 - 46.67/0.0003) * 100 = massively negative
+            # 7d sub cost = 7/30 * 200 = ~$46.67  (subscription much more expensive)
             self._write_jsonl(fp, [self._make_row("claude-sonnet-4-6", input_tokens=100)])
             with patch.object(core, "resolve_jsonl_roots", return_value=[root]):
                 with patch("builtins.print") as mock_print:
                     core.run_stats(days=7)
                     output = mock_print.call_args[0][0]
-                    # Should have a Savings line since total_cost > 0
-                    self.assertIn("Savings:", output)
-                    # The savings value should be negative
-                    # Extract the savings percentage
-                    for line in output.split("\n"):
-                        if "Savings:" in line:
-                            # Should contain a negative number
-                            self.assertIn("-", line)
-                            break
+                    self.assertIn("API is cheaper", output)
+
+
+class TestRunStatsSavingsPositive(unittest.TestCase):
+    """run_stats savings line when API cost exceeds subscription cost."""
+
+    def _make_row(self, model: str, **usage) -> dict:
+        return {
+            "sessionId": "sess-savings",
+            "message": {"model": model, "usage": usage},
+            "timestamp": "2026-04-11T10:00:00Z",
+        }
+
+    def _write_jsonl(self, path: Path, rows: list) -> None:
+        path.write_text("\n".join(__import__("json").dumps(r) for r in rows) + "\n")
+
+    def test_savings_positive_shows_savings_vs_api(self):
+        """When API cost > subscription cost, 'Savings vs API' line appears."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fp = root / "test.jsonl"
+            # 1B output tokens at opus $75/M = $75,000 >> $46.67 sub cost
+            self._write_jsonl(fp, [self._make_row("claude-opus-4-6", output_tokens=1_000_000_000)])
+            with patch.object(core, "resolve_jsonl_roots", return_value=[root]):
+                with patch("builtins.print") as mock_print:
+                    core.run_stats(days=7)
+                    output = mock_print.call_args[0][0]
+                    self.assertIn("Savings vs API", output)
+
+    def test_zero_tokens_no_savings_line(self):
+        """When total_cost=0, no savings line appears."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(core, "resolve_jsonl_roots", return_value=[root]):
+                with patch("builtins.print") as mock_print:
+                    core.run_stats(days=7)
+                    output = mock_print.call_args[0][0]
+                    self.assertNotIn("Savings", output)
+                    self.assertNotIn("API is cheaper", output)
+
+
+class TestRunCompactInjectNewline(unittest.TestCase):
+    def test_output_ends_with_single_newline(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            env_path = td_path / "config.env"
+            env_path.write_text("PLAN=max\nCOMPACT_ENABLED=true\n")
+            state_path_val = td_path / "state.json"
+            state_path_val.write_text("{}")
+            later_file = td_path / ".claude" / "LATER.md"
+            later_file.parent.mkdir(parents=True)
+            later_file.write_text("# LATER\n\n## Queue\n- [ ] (P1) task one\n")
+
+            import io
+            output = io.StringIO()
+            with patch.object(core, "config_path", return_value=env_path), \
+                 patch.object(core, "app_dir", return_value=td_path), \
+                 patch.object(core, "state_path", return_value=state_path_val), \
+                 patch.object(core, "resolve_watch_paths", return_value=[td_path]), \
+                 patch.object(core, "resolve_jsonl_roots", return_value=[]), \
+                 patch("builtins.print", side_effect=lambda *a, **kw: output.write(
+                     (a[0] if a else "") + kw.get("end", "\n")
+                 )):
+                core.run_compact_inject(cwd_hint=str(td_path))
+
+            result = output.getvalue()
+            self.assertTrue(result.endswith("\n"), "Output must end with newline")
+            self.assertFalse(result.endswith("\n\n"), "Output must not end with double newline")
+
+
+class TestBuildStatusNoFileCreation(unittest.TestCase):
+    def test_status_does_not_create_later_file(self):
+        """build_status must NOT create LATER.md — it is read-only."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            env_path = td_path / "config.env"
+            env_path.write_text("PLAN=max\n")
+            state_path_val = td_path / "state.json"
+            state_path_val.write_text("{}")
+
+            later_file = td_path / ".claude" / "LATER.md"
+
+            with patch.object(core, "config_path", return_value=env_path), \
+                 patch.object(core, "app_dir", return_value=td_path), \
+                 patch.object(core, "state_path", return_value=state_path_val), \
+                 patch.object(core, "resolve_watch_paths", return_value=[td_path]), \
+                 patch.object(core, "resolve_jsonl_roots", return_value=[]):
+                core.build_status(cwd_hint=str(td_path))
+
+            self.assertFalse(later_file.exists(),
+                             "build_status must not create LATER.md as a side effect")
 
 
 if __name__ == "__main__":

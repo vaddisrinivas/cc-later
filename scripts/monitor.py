@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pydantic>=2.0", "pydantic-settings>=2.0", "filelock>=3.0", "pendulum>=3.0", "pyte>=0.8.2"]
+# ///
 """cc-later monitor — periodic window/budget/agent monitoring.
 
 Usage:

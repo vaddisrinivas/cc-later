@@ -1149,6 +1149,65 @@ class TestInTimeWindowsNegative(unittest.TestCase):
         dt = datetime(2026, 4, 5, 12, 0)
         self.assertFalse(_in_time_windows(dt, ["garbage"]))
 
+    def test_non_string_item_skipped(self):
+        """Non-string items in windows list are skipped without raising."""
+        dt = datetime(2026, 4, 5, 12, 0)
+        # Only non-strings — no valid range → False
+        self.assertFalse(_in_time_windows(dt, [None, 42]))  # type: ignore[list-item]
+        # Mix: non-string items skipped, valid range still matches → True
+        self.assertTrue(_in_time_windows(dt, [None, "09:00-17:00"]))  # type: ignore[list-item]
+
+    def test_whitespace_trimmed_range(self):
+        """Ranges with surrounding whitespace are parsed correctly."""
+        dt = datetime(2026, 4, 5, 12, 0)
+        self.assertTrue(_in_time_windows(dt, [" 09:00-17:00 "]))
+
+
+class TestMarkDoneInContent(unittest.TestCase):
+    def test_empty_done_ids_leaves_content_unchanged(self):
+        content = "# LATER\n\n- [ ] (P1) do something\n"
+        result = core.mark_done_in_content(content, set())
+        self.assertEqual(result, content)
+
+    def test_marks_p0_task_done(self):
+        content = "- [ ] (P0) urgent fix\n"
+        result = core.mark_done_in_content(content, {core.stable_task_id(0, "urgent fix")})
+        self.assertIn("[x]", result)
+        self.assertIn("urgent fix", result)
+
+    def test_marks_exclamation_task_done(self):
+        content = "- [!] urgent bang task\n"
+        tid = core.stable_task_id(0, "urgent bang task")
+        result = core.mark_done_in_content(content, {tid})
+        self.assertIn("[x]", result)
+
+    def test_unknown_ids_leave_content_unchanged(self):
+        content = "- [ ] (P1) known task\n"
+        result = core.mark_done_in_content(content, {"t_nonexistent"})
+        self.assertEqual(result, content)
+
+
+class TestParseTasksEdgeCases(unittest.TestCase):
+    def test_empty_string_returns_no_sections(self):
+        sections = core.parse_tasks("")
+        self.assertEqual(sections, [])
+
+    def test_all_completed_returns_no_pending(self):
+        content = "## Queue\n- [x] (P1) done task\n- [x] (P1) also done\n"
+        sections = core.parse_tasks(content)
+        for s in sections:
+            self.assertEqual(s.tasks, [], f"Section {s.name!r} has unexpected pending tasks")
+
+    def test_stable_task_id_deterministic(self):
+        id1 = core.stable_task_id(5, "add rate limiting")
+        id2 = core.stable_task_id(5, "add rate limiting")
+        self.assertEqual(id1, id2)
+
+    def test_stable_task_id_differs_on_text(self):
+        id1 = core.stable_task_id(0, "task a")
+        id2 = core.stable_task_id(0, "task b")
+        self.assertNotEqual(id1, id2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -821,5 +821,86 @@ class TestValidateValuesEdgeCases(unittest.TestCase):
         core.LimitsConfig(weekly_budget_tokens=1)  # should not raise
 
 
+class TestDetectLimitExhaustionMarkers(unittest.TestCase):
+    def test_too_many_messages(self):
+        self.assertIsNotNone(core.detect_limit_exhaustion("Error: too many messages sent"))
+
+    def test_exceeded_quota(self):
+        self.assertIsNotNone(core.detect_limit_exhaustion("You exceeded your current quota"))
+
+    def test_benign_text(self):
+        self.assertIsNone(core.detect_limit_exhaustion("Task completed successfully."))
+
+    def test_case_insensitive(self):
+        self.assertIsNotNone(core.detect_limit_exhaustion("RATE LIMIT EXCEEDED"))
+
+
+class TestParseUsageScreenVariants(unittest.TestCase):
+    def test_reset_at_variant(self):
+        info = core._parse_usage_screen("Usage: 40% used\nReset at 3pm")
+        self.assertIsNotNone(info)
+        self.assertEqual(info.session_reset, "3pm")
+
+    def test_weekly_pct_with_colon(self):
+        info = core._parse_usage_screen("Weekly: 60% used")
+        self.assertIsNotNone(info)
+        self.assertEqual(info.weekly_pct, 60)
+
+
+class TestEnsureGitignoreCRLF(unittest.TestCase):
+    def test_crlf_gitignore_not_double_added(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            gi = repo / ".gitignore"
+            # CRLF line endings
+            gi.write_bytes(b".claude/LATER.md\r\nnode_modules\r\n")
+            core._ensure_gitignore(repo, ".claude/LATER.md")
+            content = gi.read_text(encoding="utf-8")
+        count = content.count(".claude/LATER.md")
+        self.assertEqual(count, 1, "Entry was duplicated despite CRLF")
+
+
+class TestIsAgentStaleNoDispatchTs(unittest.TestCase):
+    def test_no_result_no_dispatch_not_stale(self):
+        """With no timestamps available, agent is not considered stale (can't tell)."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        agent = {"entries": [], "retries": 0}  # no result_path, no dispatch_ts
+        self.assertFalse(core._is_agent_stale(agent, now, stale_minutes=10))
+
+
+class TestAsIntEdgeCases(unittest.TestCase):
+    def test_negative_int_preserved(self):
+        # _as_int is a pure int coercion; callers are responsible for clamping
+        self.assertEqual(core._as_int(-50), -50)
+
+    def test_negative_float_truncates(self):
+        self.assertEqual(core._as_int(-1.5), -1)
+
+    def test_positive_unchanged(self):
+        self.assertEqual(core._as_int(100), 100)
+
+
+class TestAutoResumeGateEmptyPaths(unittest.TestCase):
+    def test_empty_watch_paths_returns_false(self):
+        cfg = core.Config()
+        state = core.State()
+        result = core._auto_resume_gate_open(cfg, [], state, None)
+        self.assertFalse(result)
+
+
+class TestSelectTasksStableSort(unittest.TestCase):
+    def test_equal_priority_sorted_by_line_then_text(self):
+        tasks = [
+            core.Task(id="t1", text="zzz task", priority="P1", line_index=0),
+            core.Task(id="t2", text="aaa task", priority="P1", line_index=0),
+        ]
+        section = core.Section(name="test", tasks=tasks)
+        selected = core.select_tasks(section, 2)
+        # Same priority and line_index — text "aaa" comes before "zzz"
+        self.assertEqual(selected[0].text, "aaa task")
+        self.assertEqual(selected[1].text, "zzz task")
+
+
 if __name__ == "__main__":
     unittest.main()

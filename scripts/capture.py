@@ -18,8 +18,11 @@ if str(PLUGIN_ROOT) not in sys.path:
 from cc_later.core import capture_from_payload
 
 
+_MAX_STDIN_BYTES = 1_048_576  # 1MB — hook payloads should never exceed this
+
+
 def _read_payload() -> dict:
-    raw = sys.stdin.read().strip()
+    raw = sys.stdin.read(_MAX_STDIN_BYTES).strip()
     if not raw:
         return {}
     try:

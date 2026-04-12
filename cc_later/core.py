@@ -35,11 +35,14 @@ LIMIT_MARKERS = (
     "usage limit",
     "quota",
     "too many requests",
+    "too many messages",
     "429",
     "5-hour window",
     "window exhausted",
     "try again later",
+    "exceeded your current quota",
 )
+_MAX_STDIN_BYTES = 1_048_576  # 1MB cap on hook stdin payloads
 TASK_RE = re.compile(
     r"^(?P<prefix>\s*-\s*)\[(?P<mark>[ xX!])\](?P<space>\s*)(?:(?P<prio>\(P[0-2]\))\s*)?(?P<text>.+?)\s*$"
 )
@@ -539,7 +542,7 @@ def parse_tasks(content: str) -> list[Section]:
 
 def select_tasks(section: Section, limit: int) -> list[Task]:
     rank = {"P0": 0, "P1": 1, "P2": 2}
-    return sorted(section.tasks, key=lambda t: (rank.get(t.priority, 1), t.line_index))[:limit]
+    return sorted(section.tasks, key=lambda t: (rank.get(t.priority, 1), t.line_index, t.text))[:limit]
 
 
 def mark_done_in_content(content: str, done_ids: set[str]) -> str:
@@ -602,7 +605,7 @@ def _iter_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _row_timestamp(row: dict[str, Any]) -> datetime | None:
-    for key in ("timestamp", "ts", "created_at"):
+    for key in ("timestamp", "ts", "created_at", "time"):
         dt = _parse_iso(row.get(key))
         if dt is not None:
             return dt
@@ -610,6 +613,7 @@ def _row_timestamp(row: dict[str, Any]) -> datetime | None:
 
 
 def _as_int(value: Any) -> int:
+    """Coerce a JSON value to an integer. Returns 0 for non-numeric types."""
     if isinstance(value, int):
         return value
     if isinstance(value, float):
@@ -652,12 +656,12 @@ def _jsonl_files(root: Path, recursive: bool = False) -> list[Path]:
     # Top-level: only direct children of each project directory
     try:
         if recursive:
-            return list(root.rglob("*.jsonl"))
+            return sorted(root.rglob("*.jsonl"))
         results: list[Path] = []
-        for project_dir in root.iterdir():
+        for project_dir in sorted(root.iterdir()):
             try:
                 if project_dir.is_dir():
-                    results.extend(project_dir.glob("*.jsonl"))
+                    results.extend(sorted(project_dir.glob("*.jsonl")))
                 elif project_dir.suffix == ".jsonl":
                     results.append(project_dir)
             except OSError:
@@ -665,7 +669,6 @@ def _jsonl_files(root: Path, recursive: bool = False) -> list[Path]:
         return results
     except OSError:
         return []
-
 
 
 def compute_window_state(roots: list[Path], now_utc: datetime, session_id: str | None = None, session_gap_minutes: int = 30, window_duration: int = DEFAULT_WINDOW_MINUTES, window_start_hint: datetime | None = None) -> WindowState | None:
@@ -811,7 +814,18 @@ def _is_process_alive(pid: int | None) -> bool:
 
 
 def _find_claude_bin() -> str:
-    return shutil.which("claude") or "claude"
+    found = shutil.which("claude")
+    if found:
+        return found
+    # Check common install locations before falling back to bare name
+    for candidate in (
+        Path.home() / ".claude" / "local" / "claude",
+        Path("/usr/local/bin/claude"),
+        Path("/opt/homebrew/bin/claude"),
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    return "claude"
 
 
 def _spawn_dispatch(cfg: Config, repo_path: Path, prompt: str, result_path: Path, cwd: Path | None = None) -> int | None:
@@ -827,6 +841,7 @@ def _spawn_dispatch(cfg: Config, repo_path: Path, prompt: str, result_path: Path
         cmd = [_find_claude_bin(), "--output-format", "json", "--model", cfg.dispatch.model]
         if cfg.dispatch.allow_file_writes:
             cmd.append("--dangerously-skip-permissions")
+    fh = None
     try:
         fh = result_path.open("w", encoding="utf-8")
         proc = subprocess.Popen(
@@ -849,10 +864,11 @@ def _spawn_dispatch(cfg: Config, repo_path: Path, prompt: str, result_path: Path
     except OSError:
         return None
     finally:
-        try:
-            fh.close()  # type: ignore[name-defined]
-        except Exception:
-            pass
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
     return proc.pid
 
 
@@ -871,7 +887,10 @@ def _parse_hhmm(raw: str, allow_24: bool = False) -> int:
 def _in_time_windows(now_local: datetime, windows: list[str]) -> bool:
     current = now_local.hour * 60 + now_local.minute
     for item in windows:
-        if not isinstance(item, str) or "-" not in item:
+        if not isinstance(item, str):
+            continue
+        item = item.strip()
+        if "-" not in item:
             continue
         s, e = item.split("-", 1)
         try:
@@ -894,7 +913,7 @@ def _mode_gate_open(cfg: Config, now_local: datetime, window_state: WindowState 
 
 
 def _auto_resume_gate_open(cfg: Config, watch_paths: list[Path], state: State, window_state: WindowState | None) -> bool:
-    if not cfg.auto_resume.enabled:
+    if not cfg.auto_resume.enabled or not watch_paths:
         return False
     has_pending = any(bool(state.repos.get(str(repo), RepoState()).resume_entries) for repo in watch_paths)
     if not has_pending:
@@ -1033,7 +1052,7 @@ def _cleanup_worktree(repo: Path, branch: str, worktree_path: Path) -> None:
         pass
     try:
         subprocess.run(
-            ["git", "branch", "-d", branch],
+            ["git", "branch", "-D", branch],
             cwd=str(repo),
             capture_output=True,
             timeout=30,
@@ -1045,8 +1064,9 @@ def _cleanup_worktree(repo: Path, branch: str, worktree_path: Path) -> None:
 def _ensure_gitignore(repo: Path, later_path: str) -> None:
     gitignore = repo / ".gitignore"
     existing = _safe_read(gitignore) or ""
-    lines = existing.splitlines()
-    stripped = {l.strip().lstrip("/") for l in lines}
+    # Normalize both CRLF and LF line endings before splitting
+    lines = existing.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    stripped = {line.strip().lstrip("/") for line in lines}
     if later_path not in stripped:
         lines.append(later_path)
         try:
@@ -1070,6 +1090,7 @@ def _is_agent_stale(agent: dict[str, Any], now_utc: datetime, stale_minutes: int
     dispatch_ts = _parse_iso(agent.get("dispatch_ts"))
     if dispatch_ts:
         return (now_utc - dispatch_ts).total_seconds() / 60 >= stale_minutes
+    # No timestamps available — cannot determine staleness, assume not stale
     return False
 
 
@@ -1227,7 +1248,12 @@ def _reconcile(cfg: Config, state: State, now_utc: datetime) -> int:
 
 
 def _read_hook_payload(stdin_text: str | None = None) -> dict[str, Any]:
-    data = stdin_text if stdin_text is not None else (sys.stdin.read() if not sys.stdin.isatty() else "")
+    if stdin_text is not None:
+        data = stdin_text
+    elif not sys.stdin.isatty():
+        data = sys.stdin.read(_MAX_STDIN_BYTES)
+    else:
+        data = ""
     data = (data or "").strip()
     if not data:
         return {}
@@ -1480,7 +1506,6 @@ def build_status(cwd_hint: str | None = None) -> str:
     for repo in watch_paths:
         repo_state = state.repos.get(str(repo), RepoState())
         later_file = repo / cfg.later.path
-        ensure_later_file(later_file)
         sections = parse_tasks(_safe_read(later_file) or "")
         pending_count = sum(len(s.tasks) for s in sections)
         total_pending += pending_count
@@ -1593,7 +1618,7 @@ def run_compact_inject(cwd_hint: str | None = None) -> int:
     if not has_tasks:
         lines.append("LATER.md queue: empty")
 
-    print("\n".join(lines))
+    print("\n".join(lines) + "\n", end="")
     return 0
 
 
@@ -1696,9 +1721,12 @@ def run_stats(days: int = 7) -> int:
     sub_cost = days / 30 * 200  # Max plan prorated
     lines.append("")
     lines.append(f"  Max plan cost:  ${sub_cost:>14,.2f}  ({days}d @ $200/mo)")
-    if total_cost > 0:
+    if total_cost > 0 and sub_cost > 0:
         savings_pct = (1 - sub_cost / total_cost) * 100
-        lines.append(f"  Savings:        {savings_pct:>14.0f}%")
+        if savings_pct > 0:
+            lines.append(f"  Savings vs API: {savings_pct:>14.0f}%  (subscription cheaper)")
+        else:
+            lines.append(f"  API is cheaper: {abs(savings_pct):>13.0f}%  vs Max plan")
 
     print("\n".join(lines))
     return 0
@@ -1730,7 +1758,7 @@ def capture_from_payload(payload: dict[str, Any]) -> int:
     added = 0
     for match in CAPTURE_RE.finditer(prompt):
         urgent = bool(match.group(1))
-        text = match.group(2).strip().rstrip(".")
+        text = match.group(2).strip().rstrip(". \t")
         # Strip leading priority markers to avoid doubled priority like (P0) (P0)
         text = re.sub(r"^\(P[012]\)\s*", "", text).strip()
         if len(text) < 3 or text.lower() in existing_tasks:
@@ -1765,10 +1793,10 @@ def _scan_limit_events(hours: int = 24) -> dict[str, int]:
     cutoff = pendulum.now("UTC") - timedelta(hours=hours)
     try:
         size = log_path.stat().st_size
-        # Read tail (~32KB) to avoid loading full log
+        # Read tail (~128KB) to avoid loading full log while capturing 24h of events
         with log_path.open("r", encoding="utf-8") as fh:
-            if size > 32768:
-                fh.seek(size - 32768)
+            if size > 131072:
+                fh.seek(size - 131072)
                 fh.readline()  # skip partial line
             for line in fh:
                 line = line.strip()
@@ -1789,11 +1817,18 @@ def _scan_limit_events(hours: int = 24) -> dict[str, int]:
     return counts
 
 
+def _sanitize_osascript(s: str) -> str:
+    """Escape a string for safe embedding in an AppleScript double-quoted string."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _notify_macos(title: str, message: str) -> None:
     """Send macOS notification via osascript."""
     try:
+        safe_title = _sanitize_osascript(title)
+        safe_msg = _sanitize_osascript(message)
         subprocess.run(
-            ["osascript", "-e", f'display notification "{message}" with title "{title}"'],
+            ["osascript", "-e", f'display notification "{safe_msg}" with title "{safe_title}"'],
             capture_output=True, timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1811,8 +1846,10 @@ def _parse_usage_screen(text: str) -> UsageInfo | None:
         info.session_pct = int(m.group(1))
         found = True
 
-    # Reset time: "Resets 1pm", "Resets at 1:00 PM", "Resets 13:00"
+    # Reset time: "Resets 1pm", "Resets at 1:00 PM", "Reset at 13:00", "Resets 13:00"
     m = re.search(r'[Rr]esets?\s+(?:at\s+)?(\d+(?::\d+)?(?:\s*[aApP][mM])?)', text)
+    if not m:
+        m = re.search(r'[Rr]eset\s+at\s+(\d+(?::\d+)?(?:\s*[aApP][mM])?)', text)
     if m:
         info.session_reset = m.group(1).strip()
         found = True
@@ -2149,6 +2186,7 @@ __all__ = [
     "Task",
     "WindowConfig",
     "WindowState",
+    "_sanitize_osascript",
     "build_status",
     "capture_from_payload",
     "compute_budget_state",

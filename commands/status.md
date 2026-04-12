@@ -1,5 +1,7 @@
 ---
+name: status
 description: Show cc-later window, gate, queue, and recent run state.
+user_invocable: true
 ---
 
 Run the status script and display the output:

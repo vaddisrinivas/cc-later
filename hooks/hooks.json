@@ -6,7 +6,7 @@
           {
             "type": "command",
             "command": "uv run --project ${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/scripts/handler.py",
-            "timeout": 10000
+            "timeout": 30000
           }
         ]
       }
@@ -18,7 +18,7 @@
           {
             "type": "command",
             "command": "uv run --project ${CLAUDE_PLUGIN_ROOT} python3 ${CLAUDE_PLUGIN_ROOT}/scripts/capture.py",
-            "timeout": 4000
+            "timeout": 5000
           }
         ]
       }
